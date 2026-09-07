@@ -24,7 +24,10 @@ from importlib import import_module
 from datetime import datetime, time
 
 from django.conf import settings
-from django.db.models import CharField, Q, Value
+from collections import defaultdict
+from types import SimpleNamespace
+from django.apps import apps
+from django.db.models import CharField, Max, Min, Q, Sum, Value
 from django.db.models.functions import Lower, Replace
 from django.utils import timezone
 
@@ -120,7 +123,7 @@ _CURRENT_STAGE_STATUSES = {'In Progress', 'Pending'}
 
 def _stage_state(status):
     """Classify a module's raw status string into a Preview UI bg state."""
-    if not status:
+    if not status or status == 'Not Reached':
         return STATE_NOT_REACHED
     if status in _CURRENT_STAGE_STATUSES:
         return STATE_CURRENT
@@ -156,10 +159,9 @@ def _module_cell(status, in_time=None, out_time=None, lot_qty=None, accepted_qty
                   rejected_qty=None, user=None, remarks=None):
     """Format one module's cell — the same multi-line block for Preview and Excel."""
     if status == 'Not Reached':
-        return 'IN : --\nOUT: --\nStatus : Not Reached'
-    lines = [f"IN : {_fmt(in_time)}", f"OUT: {_fmt(out_time)}"]
-    if lot_qty is not None:
-        lines.append(f"Lot Qty : {lot_qty}")
+        return 'IN : --\nOUT: --\nLot Qty : --\nStatus : Not Reached'
+    lines = [f"IN : {_fmt(in_time) or '--'}", f"OUT: {_fmt(out_time) or '--'}"]
+    lines.append(f"Lot Qty : {lot_qty if lot_qty is not None else '--'}")
     if accepted_qty is not None:
         lines.append(f"Accepted : {accepted_qty}")
     if rejected_qty is not None:
@@ -205,6 +207,230 @@ def _parse_cell_lines(text):
     return rows
 
 
+TRAY_MODELS = {
+    'Input Screening': ('InputScreening', 'IPTrayId'),
+    'Brass QC': ('Brass_QC', 'BrassTrayId'),
+    'IQF': ('IQF', 'IQFTrayId'),
+    'Brass Audit': ('BrassAudit', 'BrassAuditTrayId'),
+    'Nickel Wiping': ('Nickel_Inspection', 'NickelQcTrayId'),
+    'Nickel Audit': ('Nickel_Audit', 'Nickel_AuditTrayId'),
+}
+DRAFT_MODELS = {
+    'Input Screening': ('InputScreening', 'IP_Rejection_Draft'),
+    'Brass QC': ('Brass_QC', 'Brass_QC_Draft_Store'),
+    'IQF': ('IQF', 'IQF_Draft_Store'),
+    'Brass Audit': ('BrassAudit', 'Brass_Audit_Draft_Store'),
+    'Nickel Wiping': ('Nickel_Inspection', 'Nickel_QC_Draft_Store'),
+    'Nickel Audit': ('Nickel_Audit', 'Nickel_Audit_Draft_Store'),
+}
+SUBMISSION_MODELS = {
+    'Input Screening': ('InputScreening', 'InputScreening_Submitted'),
+    'Brass QC': ('Brass_QC', 'Brass_QC_Submission'),
+    'IQF': ('IQF', 'IQF_Submitted'),
+    'Brass Audit': ('BrassAudit', 'Brass_Audit_Submission'),
+    'Nickel Wiping': ('Nickel_Inspection', 'NickelQC_Submission'),
+    'Nickel Audit': ('Nickel_Audit', 'NickelAudit_Submission'),
+    'Jig Loading': ('Jig_Loading', 'JigLoadingRecord'),
+}
+
+
+def _earliest(*values):
+    return min((v for v in values if v is not None), default=None)
+
+
+class JourneyRecords:
+    def __init__(self, lot_ids):
+        self.entries = defaultdict(dict)
+        self.submissions = defaultdict(dict)
+        self.rw_quantities = {}
+        self.is_quantities = defaultdict(dict)
+        self.dp_transfers = {}
+        self.dp_batches = {}
+        if not lot_ids:
+            return
+        # DP writes these tray transaction rows during submission, in the
+        # same transaction that makes the lot visible to Input Screening.
+        model = apps.get_model('DayPlanning', 'DPTrayId_History')
+        for row in model.objects.filter(lot_id__in=lot_ids).values(
+                'lot_id', 'batch_id_id').annotate(
+                    transfer_time=Max('date'), lot_qty=Sum('tray_quantity')):
+            self.dp_transfers[row['lot_id']] = row
+            previous = self.dp_batches.get(row['batch_id_id'])
+            self.dp_batches[row['batch_id_id']] = _latest_time(previous, row['transfer_time'])
+        for stage, model_path in TRAY_MODELS.items():
+            model = apps.get_model(*model_path)
+            rows = model.objects.filter(lot_id__in=lot_ids).values('lot_id').annotate(
+                in_time=Min('date'), lot_qty=Sum('tray_quantity'))
+            for row in rows:
+                self.entries[stage][row['lot_id']] = row
+        for stage, model_path in DRAFT_MODELS.items():
+            model = apps.get_model(*model_path)
+            for row in model.objects.filter(lot_id__in=lot_ids).values('lot_id').annotate(
+                    in_time=Min('created_at')):
+                entry = self.entries[stage].setdefault(row['lot_id'], {})
+                entry['in_time'] = _earliest(entry.get('in_time'), row['in_time'])
+        for stage, model_path in SUBMISSION_MODELS.items():
+            model = apps.get_model(*model_path)
+            scope = Q(lot_id__in=lot_ids)
+            if stage == 'Jig Loading':
+                scope |= Q(is_multi_model=True)
+            order = 'updated_at' if stage == 'Jig Loading' else 'created_at'
+            for record in model.objects.filter(scope).order_by(order, 'pk'):
+                if stage == 'Jig Loading':
+                    self._loading_record(record, lot_ids)
+                    continue
+                self.submissions[stage][record.lot_id] = record
+        for name, field in [('IS_PartialAcceptLot', 'accepted_qty'),
+                            ('IS_PartialRejectLot', 'rejected_qty')]:
+            model = apps.get_model('InputScreening', name)
+            for row in model.objects.filter(parent_lot_id__in=lot_ids).values(
+                    'parent_lot_id').annotate(quantity=Sum(field)):
+                self.is_quantities[row['parent_lot_id']][field] = row['quantity']
+        # IQF's incoming quantity is the receiving lot's rejection allocation,
+        # not the full original batch quantity. Use the latest saved allocation.
+        for app, name in [('Brass_QC', 'Brass_QC_Rejection_ReasonStore'),
+                          ('BrassAudit', 'Brass_Audit_Rejection_ReasonStore')]:
+            model = apps.get_model(app, name)
+            for row in model.objects.filter(lot_id__in=lot_ids).order_by('created_at', 'pk'):
+                previous = self.rw_quantities.get(row.lot_id)
+                key = (row.created_at, row.pk)
+                if previous is None or key > previous[0]:
+                    self.rw_quantities[row.lot_id] = (key, row.total_rejection_quantity)
+        for zone in (1, 2):
+            stage = f'Spider Spindle Z{zone}'
+            model = apps.get_model(f'SpiderSpindle_Z{zone}', f'SpiderSpindleZ{zone}TrayId')
+            for row in model.objects.filter(lot_id__in=lot_ids).values('lot_id').annotate(
+                    in_time=Min('linked_at')):
+                self.entries[stage][row['lot_id']] = row
+        model = apps.get_model('Jig_Unloading', 'JUSubmittedZ1')
+        for row in model.objects.filter(lot_id__in=lot_ids).order_by('submitted_at', 'pk'):
+            self.submissions['Jig Unloading'][row.lot_id] = row
+            self.entries['Jig Unloading'][row.lot_id] = {
+                'in_time': row.submitted_at, 'lot_qty': row.total_qty}
+        model = apps.get_model('Jig_Unloading', 'JigUnloadDraft')
+        for row in model.objects.filter(main_lot_id__in=lot_ids).order_by('created_at', 'pk'):
+            entry = self.entries['Jig Unloading'].setdefault(row.main_lot_id, {})
+            entry['in_time'] = _earliest(entry.get('in_time'), row.created_at)
+            entry.setdefault('lot_qty', row.total_quantity)
+        model = apps.get_model('Jig_Loading', 'JigLoadingManualDraft')
+        for row in model.objects.filter(lot_id__in=lot_ids).order_by('updated_at', 'pk'):
+            # This legacy draft has no creation timestamp. Its mutable
+            # updated_at cannot truthfully stand in for the original IN time.
+            self.entries['Jig Loading'].setdefault(row.lot_id, {
+                'in_time': None, 'lot_qty': row.original_lot_qty})
+
+    def _loading_record(self, record, lot_ids):
+        allocations = {str(a['lot_id']): a for a in record.multi_model_allocation or []
+                       if isinstance(a, dict) and a.get('lot_id')}
+        for lot_id in ({record.lot_id} | allocations.keys()) & lot_ids:
+            allocation = allocations.get(lot_id, {})
+            quantity = allocation.get('requested_qty', allocation.get('model_lot_qty'))
+            if quantity is None and lot_id == record.lot_id:
+                quantity = record.lot_qty
+            loaded = allocation.get('allocated_qty')
+            if loaded is None and lot_id == record.lot_id:
+                loaded = record.loaded_cases_qty
+            self.entries['Jig Loading'][lot_id] = {
+                'in_time': record.created_at, 'lot_qty': quantity}
+            self.submissions['Jig Loading'][lot_id] = SimpleNamespace(
+                status_flag=record.status_flag, lot_qty=quantity,
+                loaded_cases_qty=loaded, updated_at=record.updated_at)
+
+    def _receive(self, stage, lot_id, received_at, quantity):
+        entry = self.entries[stage].setdefault(lot_id, {})
+        entry['in_time'] = _earliest(entry.get('in_time'), received_at)
+        if entry.get('lot_qty') is None:
+            entry['lot_qty'] = quantity
+
+    def add_stock_receipts(self, stocks):
+        """Use the receiving pick-table gates even before local scan/draft rows."""
+        for stock in stocks:
+            batch = stock.batch_id
+            # DP writes the destination while drafting too. IS only receives
+            # it when Moved_to_D_Picker becomes true (IS selector's own gate).
+            if (batch and batch.Moved_to_D_Picker and stock.tray_scan_status
+                    and not stock.lot_id.startswith('EX-')):
+                transfer = self.dp_transfers.get(stock.lot_id, {})
+                self._receive('Input Screening', stock.lot_id,
+                              transfer.get('transfer_time'),
+                              transfer.get('lot_qty', stock.total_stock))
+            # Jig Pick's actual eligibility is Brass Audit acceptance, not
+            # existence of a later JigCompleted draft/submission.
+            if (stock.brass_audit_accptance or
+                    (stock.brass_audit_few_cases_accptance
+                     and not stock.brass_audit_onhold_picking)):
+                self._receive('Jig Loading', stock.lot_id,
+                              stock.brass_audit_last_process_date_time,
+                              stock.brass_audit_accepted_qty)
+            # These are explicit destinations written by the submit services,
+            # not an assumed linear module order. IQF acceptance returns to QC.
+            routes = {
+                'Input Screening': ('last_process_date_time', {'Brass QC'}),
+                'Brass QC': ('bq_last_process_date_time', {'IQF', 'Brass Audit'}),
+                'IQF': ('iqf_last_process_date_time', {'Brass QC'}),
+                'Brass Audit': ('brass_audit_last_process_date_time',
+                                {'Jig Loading', 'IQF', 'Brass QC'}),
+            }
+            route = routes.get(stock.last_process_module)
+            destination = stock.next_process_module
+            if route and destination in route[1]:
+                transferred_at = getattr(stock, route[0], None)
+                if transferred_at:
+                    quantity = stock.total_stock
+                    if destination == 'IQF':
+                        quantity = self.rw_quantities.get(
+                            stock.lot_id, (None, stock.total_IP_accpeted_quantity))[1]
+                    self._receive(destination, stock.lot_id, transferred_at, quantity)
+
+    def entry(self, stage, lot_id):
+        return self.entries[stage].get(lot_id)
+
+    def submission(self, stage, lot_id):
+        return self.submissions[stage].get(lot_id)
+
+
+def submission_values(stage, record):
+    """Read final quantities from immutable module submission snapshots."""
+    if record is None:
+        return {}
+    if stage == 'Input Screening':
+        completed = record.is_submitted and not record.Draft_Saved
+        status = ('Rejected' if record.is_full_reject else
+                  'Accepted' if record.is_full_accept else 'Partially Accepted')
+        # IS stores split quantities in child tables; retain stock quantities
+        # for partial submissions, but full decisions are explicit snapshots.
+        values = {'lot_qty': record.original_lot_qty}
+        if record.is_full_accept:
+            values.update(accepted_qty=record.original_lot_qty, rejected_qty=0)
+        elif record.is_full_reject:
+            values.update(accepted_qty=0, rejected_qty=record.original_lot_qty)
+        out_time = record.submitted_at
+    elif stage == 'Jig Loading':
+        completed = record.status_flag == 'SUBMITTED'
+        status = 'Completed'
+        values = {'lot_qty': record.lot_qty, 'accepted_qty': record.loaded_cases_qty}
+        out_time = record.updated_at
+    elif stage == 'Jig Unloading':
+        completed = not record.is_draft
+        status = 'Completed'
+        values = {'lot_qty': record.total_qty}
+        out_time = record.updated_at
+    else:
+        completed = getattr(record, 'is_completed', True) and not getattr(record, 'is_draft', False)
+        status = {'FULL_ACCEPT': 'Accepted', 'FULL_REJECT': 'Rejected',
+                  'LOT_REJECTION': 'Rejected', 'PARTIAL': 'Partially Accepted'}[record.submission_type]
+        values = {'lot_qty': (record.iqf_incoming_qty if stage == 'IQF' else record.total_lot_qty),
+                  'accepted_qty': record.accepted_qty, 'rejected_qty': record.rejected_qty}
+        out_time = record.created_at
+    values.update(status=status if completed else 'In Progress',
+                  out_time=out_time if completed else None)
+    if not completed:
+        values.pop('accepted_qty', None)
+        values.pop('rejected_qty', None)
+    return values
+
+
+
 def _early_module_status(stock, spec):
     """Return (status, out_time) for one of the four split-capable modules,
     or (None, None) if this row was never processed at that module."""
@@ -216,8 +442,8 @@ def _early_module_status(stock, spec):
     onhold = getattr(stock, spec['onhold_flag'], False)
     if few and not onhold:
         return 'Partially Accepted', getattr(stock, spec['out_time_field'], None)
-    if few and onhold:
-        return 'In Progress', getattr(stock, spec['out_time_field'], None)
+    if onhold:
+        return 'In Progress', None
     return None, None
 
 
@@ -235,210 +461,249 @@ def _pick_early_module_row(stocks_for_batch, spec):
     return best
 
 
-def _early_module_cells(stocks_for_batch, prev_out_time):
-    """Build cells for Input Screening / Brass QC / IQF / Brass Audit, in
-    order, threading each reached stage's out-time forward as the next
-    stage's in-time. Returns (cells, statuses, last_out_time)."""
-    cells = {}
-    statuses = {}
-    running_out = prev_out_time
+def _latest_time(*values):
+    return max((value for value in values if value is not None), default=None)
+
+
+def _day_planning_cell(batch, transfer_time=None):
+    if batch is None:
+        return _module_cell('Not Reached'), None
+    status = 'Completed' if batch.Moved_to_D_Picker else 'In Progress'
+    # The DP transaction timestamp is also the IS receipt event: IS has no
+    # separate incoming row until a later scan/draft. Never use batch IN as OUT.
+    return _module_cell(status, in_time=batch.date_time,
+                        out_time=transfer_time if batch.Moved_to_D_Picker else None,
+                        lot_qty=batch.total_batch_quantity,
+                        remarks=batch.dp_pick_remarks), status
+
+
+def _early_module_cells(stocks_for_batch, prev_out_time=None, records=None):
+    cells, statuses = {}, {}
+    activity = None
     for name, spec in _EARLY_MODULE_SPECS:
-        match = _pick_early_module_row(stocks_for_batch, spec)
-        if not match:
-            cells[name] = _module_cell('Not Reached')
-            statuses[name] = None
+        candidates = []
+        has_submission = bool(records and any(
+            records.submission(name, row.lot_id) for row in stocks_for_batch))
+        bq_transition_lots = set()
+        if name == 'Brass QC' and records:
+            for parent in stocks_for_batch:
+                saved = records.submission(name, parent.lot_id)
+                if saved and saved.is_completed:
+                    bq_transition_lots.update(
+                        value for value in (
+                            getattr(saved, 'transition_lot_id', None),
+                            getattr(saved, 'transition_accept_lot_id', None),
+                            getattr(saved, 'transition_reject_lot_id', None),
+                        ) if value)
+        for stock in stocks_for_batch:
+            entry = records.entry(name, stock.lot_id) if records else None
+            submission = records.submission(name, stock.lot_id) if records else None
+            if (name == 'Brass QC' and stock.lot_id in bq_transition_lots
+                    and not submission and stock.next_process_module != 'Brass QC'
+                    and not (stock.current_stage == 'Brass QC'
+                             and stock.last_process_module != 'Brass QC')):
+                # This is the submitted parent's destination lot, not a new QC
+                # execution. Its stale current_stage must not override the final
+                # snapshot. A later return to QC or own submission remains eligible.
+                continue
+            status, out_time = _early_module_status(stock, spec)
+            if has_submission and not submission and status not in (None, 'In Progress'):
+                # Split children inherit upstream flags; their creation is not
+                # another execution of the parent's completed module.
+                continue
+            reached = bool(entry is not None or submission or status or
+                           getattr(stock, 'current_stage', None) == name or
+                           getattr(stock, 'next_process_module', None) == name)
+            if not reached:
+                continue
+            values = dict(status=status or 'In Progress',
+                          in_time=(entry or {}).get('in_time'),
+                          out_time=out_time, lot_qty=(entry or {}).get('lot_qty'),
+                          remarks=getattr(stock, spec['remarks_field'], None))
+            if status and status != 'In Progress':
+                values['accepted_qty'] = getattr(stock, spec['accepted_qty_field'], None)
+                if spec['rejected_qty_field']:
+                    values['rejected_qty'] = getattr(stock, spec['rejected_qty_field'], None)
+            if name == STAGE_IQF and records and stock.lot_id in records.rw_quantities:
+                values['lot_qty'] = records.rw_quantities[stock.lot_id][1]
+            values.update(submission_values(name, submission))
+            if name == STAGE_INPUT_SCREENING and submission and records:
+                if values['status'] == 'Partially Accepted':
+                    values.update(records.is_quantities.get(stock.lot_id, {}))
+            if values['status'] == 'In Progress':
+                if values['lot_qty'] is None:
+                    values['lot_qty'] = (stock.total_IP_accpeted_quantity
+                                         if name == STAGE_IQF else stock.total_stock)
+                values['out_time'] = None
+                values.pop('accepted_qty', None)
+                values.pop('rejected_qty', None)
+            event = _latest_time(values['in_time'], values['out_time'])
+            # A saved parent submission is authoritative over copied child
+            # completion flags. Ties are stable even when timestamps coincide.
+            key = (event is not None, event, submission is not None, str(stock.lot_id))
+            candidates.append((key, values))
+        if not candidates:
+            cells[name], statuses[name] = _module_cell('Not Reached'), None
             continue
-        stock, status, out_time = match
-        lot_qty = int(stock.total_stock or 0)
-        accepted_qty = getattr(stock, spec['accepted_qty_field'], None)
-        rejected_qty_field = spec['rejected_qty_field']
-        if rejected_qty_field:
-            rejected_qty = getattr(stock, rejected_qty_field, None)
-        elif status == 'Rejected':
-            rejected_qty = lot_qty - int(accepted_qty or 0)
-        else:
-            rejected_qty = None
-        cells[name] = _module_cell(
-            status,
-            in_time=running_out,
-            out_time=out_time,
-            lot_qty=lot_qty,
-            accepted_qty=accepted_qty,
-            rejected_qty=rejected_qty,
-            remarks=getattr(stock, spec['remarks_field'], None),
-        )
-        statuses[name] = status
-        running_out = out_time or running_out
-    return cells, statuses, running_out
+        values = max(candidates, key=lambda item: item[0])[1]
+        cells[name] = _module_cell(**values)
+        statuses[name] = values['status']
+        activity = _latest_time(activity, values['in_time'], values['out_time'])
+    return cells, statuses, activity
 
 
-def _jig_loading_cells(jig_record, prev_out_time):
-    """Returns (jig_loading_cell, ip_inspection_cell, jig_status, ip_status, last_out_time)."""
-    if not jig_record:
-        return (
-            _module_cell('Not Reached'), _module_cell('Not Reached'),
-            None, None, prev_out_time,
-        )
+def _jig_loading_cells(jig_record, prev_out_time=None, records=None, lot_id=None):
+    entry = records.entry(STAGE_JIG_LOADING, lot_id) if records else None
+    submission = records.submission(STAGE_JIG_LOADING, lot_id) if records else None
+    if not jig_record and not submission and entry is None:
+        return (_module_cell('Not Reached'), _module_cell('Not Reached'),
+                None, None, None)
+    submitted = bool(jig_record and jig_record.draft_status == 'submitted')
+    values = dict(status='Completed' if submitted else 'In Progress',
+                  in_time=(entry or {}).get('in_time'),
+                  lot_qty=(entry or {}).get('lot_qty'), out_time=None)
+    if jig_record:
+        if values['lot_qty'] is None:
+            values['lot_qty'] = jig_record.original_lot_qty
+        values['remarks'] = _first_remark(jig_record.pick_remarks, jig_record.remarks)
+    values.update(submission_values(STAGE_JIG_LOADING, submission))
+    jig_cell = _module_cell(**values)
+    activity = _latest_time(values['in_time'], values['out_time'])
+    # A submitted loading record is the actual handoff into IP Inspection.
+    # IP_loaded_date_time belongs to IP Inspection, never Jig Loading.
+    if not submitted:
+        return jig_cell, _module_cell('Not Reached'), values['status'], None, activity
+    ip_done = bool(jig_record.jig_position)
+    ip_out = jig_record.IP_loaded_date_time if ip_done else None
+    ip_status = 'Completed' if ip_done else 'In Progress'
+    ip_cell = _module_cell(ip_status, in_time=values['out_time'], out_time=ip_out,
+                           lot_qty=values.get('accepted_qty', jig_record.loaded_cases_qty),
+                           remarks=jig_record.remarks)
+    return jig_cell, ip_cell, values['status'], ip_status, _latest_time(activity, ip_out)
 
-    jig_out = jig_record.IP_loaded_date_time or jig_record.updated_at
-    jig_cell = _module_cell(
-        'Completed',
-        in_time=prev_out_time,
-        out_time=jig_out,
-        lot_qty=jig_record.original_lot_qty or jig_record.updated_lot_qty,
-        accepted_qty=jig_record.loaded_cases_qty,
-        user=jig_record.user.username if getattr(jig_record, 'user_id', None) else None,
-        remarks=_first_remark(jig_record.pick_remarks, jig_record.remarks),
-    )
-    if jig_record.jig_position:
-        ip_cell = _module_cell(
-            'Completed',
-            in_time=jig_out,
-            out_time=jig_record.updated_at,
-            remarks=jig_record.remarks,
-        )
-        return jig_cell, ip_cell, 'Completed', 'Completed', jig_record.updated_at
-    return jig_cell, _module_cell('Not Reached'), 'Completed', None, jig_out
 
+def _late_module_cells(unload_record, zone_map, prev_out_time=None, records=None,
+                       lot_id=None, plating_color_id=None, jig_record=None):
+    columns = MODULE_COLUMNS[7:]
+    cells = {name: _module_cell('Not Reached') for name in columns}
+    statuses = dict.fromkeys(columns)
+    zone = zone_map.get(unload_record.plating_color_id if unload_record else plating_color_id)
+    activity = None
 
-def _late_module_cells(unload_record, zone_map, prev_out_time):
-    """Build cells for Jig Unloading / Nickel Wiping / Nickel Audit / Spider
-    Spindle, each split into Z1/Z2 columns. Returns (cells, statuses,
-    last_out_time) covering all 8 zone columns."""
-    zone_columns = [
-        STAGE_JIG_UNLOADING_Z1, STAGE_JIG_UNLOADING_Z2,
-        STAGE_NICKEL_WIPING_Z1, STAGE_NICKEL_WIPING_Z2,
-        STAGE_NICKEL_AUDIT_Z1, STAGE_NICKEL_AUDIT_Z2,
-        STAGE_SS_Z1, STAGE_SS_Z2,
-    ]
-    cells = {name: _module_cell('Not Reached') for name in zone_columns}
-    statuses = {name: None for name in zone_columns}
+    def put(name, values):
+        nonlocal activity
+        cells[name] = _module_cell(**values)
+        statuses[name] = values['status']
+        activity = _latest_time(activity, values.get('in_time'), values.get('out_time'))
+
+    unloading_entry = records.entry('Jig Unloading', lot_id) if records else None
+    unloading_submission = records.submission('Jig Unloading', lot_id) if records else None
+    if (zone and jig_record and jig_record.IP_loaded_date_time
+            and (jig_record.last_process_module == 'Inprocess Inspection'
+                 or jig_record.jig_position)):
+        # Inspection submit is the actual handoff opening Unloading Pick.
+        unloading_entry = dict(unloading_entry or {})
+        unloading_entry['in_time'] = _earliest(
+            unloading_entry.get('in_time'), jig_record.IP_loaded_date_time)
+        unloading_entry.setdefault('lot_qty', jig_record.loaded_cases_qty)
+    if zone and unloading_entry is not None:
+        values = dict(status='In Progress', in_time=unloading_entry.get('in_time'),
+                      lot_qty=unloading_entry.get('lot_qty'))
+        values.update(submission_values('Jig Unloading', unloading_submission))
+        put(f'Jig Unloading {zone.upper()}', values)
     if not unload_record:
-        return cells, statuses, prev_out_time
-
-    zone = zone_map.get(unload_record.plating_color_id)
-    running_out = prev_out_time
-
-    # Jig Unloading itself uses generic (non nq_*/na_* prefixed) fields —
-    # Zone 1/2 is still the same JigUnloadAfterTable row, routed by the
-    # lot's Plating_Color allow-list, same as Nickel Wiping/Audit below.
-    ju_status = 'Accepted' if unload_record.unload_accepted else (
-        'Completed' if unload_record.Un_loaded_date_time else 'Pending'
-    )
-    ju_remarks = (
-        f"Missing qty: {unload_record.unload_missing_qty}"
-        if unload_record.unload_missing_qty else ''
-    )
-    ju_cell = _module_cell(
-        ju_status,
-        in_time=unload_record.created_at,
-        out_time=unload_record.Un_loaded_date_time,
-        lot_qty=unload_record.total_case_qty,
-        accepted_qty=unload_record.accepted_qty,
-        remarks=ju_remarks,
-    )
-    ju_out = unload_record.Un_loaded_date_time or unload_record.created_at
-    if zone == 'z1':
-        cells[STAGE_JIG_UNLOADING_Z1] = ju_cell
-        statuses[STAGE_JIG_UNLOADING_Z1] = ju_status
-    elif zone == 'z2':
-        cells[STAGE_JIG_UNLOADING_Z2] = ju_cell
-        statuses[STAGE_JIG_UNLOADING_Z2] = ju_status
-    running_out = ju_out or running_out
-
-    # Nickel Wiping
-    nq_out = ju_out
-    if (unload_record.nq_qc_accptance or unload_record.nq_qc_rejection
-            or (unload_record.nq_qc_few_cases_accptance and not unload_record.nq_onhold_picking)):
-        nq_status = (
-            'Rejected' if unload_record.nq_qc_rejection
-            else 'Accepted' if unload_record.nq_qc_accptance
-            else 'Partially Accepted'
-        )
-        nq_cell = _module_cell(
-            nq_status,
-            in_time=ju_out,
-            out_time=unload_record.nq_last_process_date_time,
+        return cells, statuses, activity
+    if zone:
+        ju_done = bool(unload_record.unload_accepted or unload_record.Un_loaded_date_time)
+        put(f'Jig Unloading {zone.upper()}', dict(
+            status=('Accepted' if unload_record.unload_accepted else 'Completed') if ju_done else 'In Progress',
+            in_time=(unloading_entry or {}).get('in_time') or unload_record.created_at,
+            out_time=unload_record.Un_loaded_date_time if ju_done else None,
             lot_qty=unload_record.total_case_qty,
-            accepted_qty=unload_record.nq_qc_accepted_qty,
-            rejected_qty=unload_record.nq_missing_qty or None,
-            remarks=unload_record.nq_pick_remarks,
-        )
-        nq_out = unload_record.nq_last_process_date_time or ju_out
-        if zone == 'z1':
-            cells[STAGE_NICKEL_WIPING_Z1] = nq_cell
-            statuses[STAGE_NICKEL_WIPING_Z1] = nq_status
-        elif zone == 'z2':
-            cells[STAGE_NICKEL_WIPING_Z2] = nq_cell
-            statuses[STAGE_NICKEL_WIPING_Z2] = nq_status
-        running_out = nq_out or running_out
-
-    # Nickel Audit
-    na_out = nq_out
-    if (unload_record.na_qc_accptance or unload_record.na_qc_rejection
-            or (unload_record.na_qc_few_cases_accptance and not unload_record.na_onhold_picking)):
-        na_status = (
-            'Rejected' if unload_record.na_qc_rejection
-            else 'Accepted' if unload_record.na_qc_accptance
-            else 'Partially Accepted'
-        )
-        na_cell = _module_cell(
-            na_status,
-            in_time=nq_out,
-            out_time=unload_record.na_last_process_date_time,
-            lot_qty=unload_record.total_case_qty,
-            accepted_qty=unload_record.na_qc_accepted_qty,
-            rejected_qty=unload_record.na_missing_qty or None,
-            remarks=unload_record.na_pick_remarks,
-        )
-        na_out = unload_record.na_last_process_date_time or nq_out
-        if zone == 'z1':
-            cells[STAGE_NICKEL_AUDIT_Z1] = na_cell
-            statuses[STAGE_NICKEL_AUDIT_Z1] = na_status
-        elif zone == 'z2':
-            cells[STAGE_NICKEL_AUDIT_Z2] = na_cell
-            statuses[STAGE_NICKEL_AUDIT_Z2] = na_status
-        running_out = na_out or running_out
-
-    # Spider Spindle — independent zone-completion flags, not tied to the
-    # plating-color zone used above.
-    if getattr(unload_record, 'ss_z1_completed', False):
-        cells[STAGE_SS_Z1] = _module_cell(
-            'Completed',
-            in_time=na_out,
-            out_time=unload_record.ss_z1_completed_at,
-            user=(unload_record.ss_z1_completed_by.username
-                  if unload_record.ss_z1_completed_by_id else None),
-            remarks=unload_record.spider_pick_remarks,
-        )
-        statuses[STAGE_SS_Z1] = 'Completed'
-        running_out = unload_record.ss_z1_completed_at or running_out
-    if getattr(unload_record, 'ss_z2_completed', False):
-        cells[STAGE_SS_Z2] = _module_cell(
-            'Completed',
-            in_time=na_out,
-            out_time=unload_record.ss_z2_completed_at,
-            user=(unload_record.ss_z2_completed_by.username
-                  if unload_record.ss_z2_completed_by_id else None),
-            remarks=unload_record.spider_pick_remarks,
-        )
-        statuses[STAGE_SS_Z2] = 'Completed'
-        running_out = unload_record.ss_z2_completed_at or running_out
-
-    return cells, statuses, running_out
+            accepted_qty=unload_record.accepted_qty if ju_done else None))
+        for stage, prefix in [('Nickel Wiping', 'nq'), ('Nickel Audit', 'na')]:
+            entry = records.entry(stage, unload_record.lot_id) if records else None
+            submission = records.submission(stage, unload_record.lot_id) if records else None
+            accept = getattr(unload_record, prefix + '_qc_accptance')
+            reject = getattr(unload_record, prefix + '_qc_rejection')
+            partial = getattr(unload_record, prefix + '_qc_few_cases_accptance')
+            hold = getattr(unload_record, prefix + '_onhold_picking')
+            done = accept or reject or (partial and not hold)
+            # Nickel Audit can be re-entered under the same lot id. Its pick
+            # table ignores rejection history older than a fresh NW acceptance.
+            received = (unload_record.total_case_qty > 0 if stage == 'Nickel Wiping'
+                        else (unload_record.nq_qc_accptance or
+                              (unload_record.nq_qc_few_cases_accptance
+                               and not unload_record.nq_onhold_picking)))
+            cycle_time = unload_record.nq_last_process_date_time
+            previous_out = unload_record.na_last_process_date_time
+            if (stage == 'Nickel Audit' and received and cycle_time
+                    and previous_out and cycle_time > previous_out):
+                done = False
+                if submission and submission.created_at <= cycle_time:
+                    submission = None
+                if entry and (not entry.get('in_time') or entry['in_time'] <= cycle_time):
+                    entry = None
+            transfer_time = None
+            if received:
+                if stage == 'Nickel Wiping':
+                    transfer_time = (unload_record.Un_loaded_date_time
+                                     or unload_record.created_at)
+                    # Audit rejection explicitly routes this same row to NW.
+                    if (unload_record.na_qc_rejection and previous_out
+                            and (not cycle_time or previous_out > cycle_time)):
+                        transfer_time = previous_out
+                        done = False
+                        if submission and submission.created_at <= transfer_time:
+                            submission = None
+                        entry = None
+                else:
+                    transfer_time = cycle_time
+            current = getattr(unload_record, 'current_stage', None)
+            reached = (received or entry is not None or submission or done or partial or hold or
+                       getattr(unload_record, prefix + '_draft') or current == stage or
+                       (stage == 'Nickel Wiping' and current == 'Nickel Inspection'))
+            if not reached:
+                continue
+            values = dict(status=('Rejected' if reject else 'Accepted' if accept else
+                                   'Partially Accepted') if done else 'In Progress',
+                          in_time=transfer_time or (entry or {}).get('in_time'),
+                          out_time=getattr(unload_record, prefix + '_last_process_date_time') if done else None,
+                          lot_qty=(entry or {}).get('lot_qty'),
+                          accepted_qty=getattr(unload_record, prefix + '_qc_accepted_qty') if done else None,
+                          remarks=getattr(unload_record, prefix + '_pick_remarks'))
+            values.update(submission_values(stage, submission))
+            if values['lot_qty'] is None:
+                values['lot_qty'] = unload_record.total_case_qty
+            put(f'{stage} {zone.upper()}', values)
+    for number in (1, 2):
+        stage = f'Spider Spindle Z{number}'
+        entry = records.entry(stage, unload_record.lot_id) if records else None
+        done = getattr(unload_record, f'ss_z{number}_completed', False)
+        received = (zone == f'z{number}' and unload_record.na_qc_accptance
+                    and unload_record.total_case_qty > 0)
+        if not done and entry is None and not received:
+            continue
+        put(stage, dict(status='Completed' if done else 'In Progress',
+                        in_time=(unload_record.na_last_process_date_time if received else None)
+                                or (entry or {}).get('in_time'),
+                        out_time=getattr(unload_record, f'ss_z{number}_completed_at') if done else None,
+                        lot_qty=unload_record.total_case_qty,
+                        remarks=unload_record.spider_pick_remarks))
+    return cells, statuses, activity
 
 
 def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=''):
     """
-    Build the consolidated journey rows. One row per Plating Stock No, using
-    the batch with the most recent stage activity. Every module column is
+    Build the consolidated journey rows. One row per stock lot, or per
+    planning batch before stock creation; plating numbers may repeat. Every module column is
     always populated — either with its actual data or "Not Reached" — so the
     report shows the complete lifecycle rather than only the latest stage.
 
     date_from / date_to filter on the latest stage activity timestamp.
     plating_stock_no is a partial (icontains) match.
     """
-    from modelmasterapp.models import TotalStockModel, Plating_Color
+    from modelmasterapp.models import TotalStockModel, Plating_Color, ModelMasterCreation
     from Jig_Loading.models import JigCompleted
     from Jig_Unloading.models import JigUnloadAfterTable
 
@@ -446,7 +711,7 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
         batch_id__isnull=False,
         batch_id__total_batch_quantity__gt=0,
         remove_lot=False,
-    ).select_related('batch_id').order_by('-created_at')
+    ).select_related('batch_id').order_by('-created_at', '-pk')
 
     if plating_stock_no:
         stock_qs = stock_qs.filter(
@@ -472,18 +737,18 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
     if batch_ids:
         for s in TotalStockModel.objects.filter(
             batch_id_id__in=batch_ids
-        ).exclude(lot_id__startswith='EX-'):
+        ).exclude(lot_id__startswith='EX-').select_related('batch_id').order_by('created_at', 'pk'):
             stocks_by_batch.setdefault(s.batch_id_id, []).append(s)
+
+    lot_ids.update(s.lot_id for group in stocks_by_batch.values() for s in group if s.lot_id)
 
     # Bulk maps — avoid N+1
     jig_by_lot = {}
-    for record in JigCompleted.objects.filter(
-        draft_status='submitted'
-    ).order_by('updated_at').only(
+    for record in JigCompleted.objects.select_related('user').order_by('updated_at', 'pk').only(
         'lot_id', 'jig_position', 'updated_at', 'pick_remarks',
         'remarks', 'unloading_remarks', 'multi_model_allocation',
         'IP_loaded_date_time', 'original_lot_qty', 'updated_lot_qty',
-        'loaded_cases_qty', 'user',
+        'loaded_cases_qty', 'user', 'user__username', 'draft_status', 'last_process_module',
     ):
         keys = {record.lot_id}
         for allocation in record.multi_model_allocation or []:
@@ -491,10 +756,10 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
                 keys.add(str(allocation['lot_id']))
         for key in keys:
             if key in lot_ids:
-                jig_by_lot[key] = record  # latest submitted wins
+                jig_by_lot[key] = record  # latest actual draft/submission wins
 
     unload_by_lot = {}
-    for record in JigUnloadAfterTable.objects.all().order_by('Un_loaded_date_time'):
+    for record in JigUnloadAfterTable.objects.all().order_by('created_at', 'pk'):
         keys = {_normalize_unload_lot_id(record.lot_id)}
         for combined in record.combine_lot_ids or []:
             keys.add(_normalize_unload_lot_id(combined))
@@ -511,6 +776,9 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
         elif pc.jig_unload_zone_2:
             zone_map[pc.id] = 'z2'
 
+    records = JourneyRecords(lot_ids | {r.lot_id for r in unload_by_lot.values()})
+    records.add_stock_receipts(row for group in stocks_by_batch.values() for row in group)
+
     tz_aware = timezone.is_aware(timezone.now())
 
     def to_dt(d, end=False):
@@ -520,7 +788,33 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
     from_dt = to_dt(date_from) if date_from else None
     to_dt_val = to_dt(date_to, end=True) if date_to else None
 
-    best_by_stk = {}
+    rows_by_lot = {}
+    # DP Pick already contains the batch before its first tray scan creates a
+    # TotalStockModel lot. Include those real planning rows, without fabricating
+    # stock records or inferring any downstream module entry.
+    planning = ModelMasterCreation.objects.filter(
+        total_batch_quantity__gt=0,
+    ).exclude(pk__in=TotalStockModel.objects.filter(
+        batch_id__isnull=False).values('batch_id')).order_by('-date_time', '-pk')
+    if plating_stock_no:
+        planning = planning.filter(plating_stk_no__icontains=plating_stock_no.strip())
+    for batch in planning:
+        stk_no = (batch.plating_stk_no or '').strip()
+        activity = batch.date_time
+        if (not stk_no or (from_dt and (not activity or activity < from_dt))
+                or (to_dt_val and activity and activity > to_dt_val)):
+            continue
+        dp_cell, dp_status = _day_planning_cell(batch)
+        modules = {name: _module_cell('Not Reached') for name in MODULE_COLUMNS}
+        modules[STAGE_DAY_PLANNING] = dp_cell
+        states = {name: STATE_NOT_REACHED for name in MODULE_COLUMNS}
+        states[STAGE_DAY_PLANNING] = _stage_state(dp_status)
+        rows_by_lot[('batch', batch.pk)] = {
+            'plating_stk_no': stk_no, 'lot_qty': batch.total_batch_quantity,
+            'modules': modules, 'module_states': states,
+            'module_details': {name: _parse_cell_lines(cell) for name, cell in modules.items()},
+            'remarks': batch.dp_pick_remarks or '', '_activity': activity,
+        }
     for stock in stocks:
         batch = stock.batch_id
         stk_no = (batch.plating_stk_no or '').strip()
@@ -531,24 +825,19 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
         unload_record = unload_by_lot.get(stock.lot_id)
         stocks_for_batch = stocks_by_batch.get(stock.batch_id_id) or [stock]
 
-        dp_reached = bool(batch.Moved_to_D_Picker or stock.tray_scan_status)
-        dp_out = batch.date_time or stock.created_at
-        dp_cell = _module_cell(
-            'Completed',
-            in_time=dp_out,
-            out_time=dp_out,
-            lot_qty=batch.total_batch_quantity,
-            remarks=batch.dp_pick_remarks,
-        ) if dp_reached else _module_cell('Not Reached')
+        dp_cell, dp_status = _day_planning_cell(batch, records.dp_batches.get(batch.pk))
 
         early_cells, early_statuses, running_out = _early_module_cells(
-            stocks_for_batch, dp_out if dp_reached else stock.created_at
+            stocks_for_batch, records=records
         )
+        early_activity = running_out
         jig_cell, ip_cell, jig_status, ip_status, running_out = _jig_loading_cells(
-            jig_record, running_out
+            jig_record, records=records, lot_id=stock.lot_id
         )
+        jig_activity = running_out
         late_cells, late_statuses, running_out = _late_module_cells(
-            unload_record, zone_map, running_out
+            unload_record, zone_map, records=records, lot_id=stock.lot_id,
+            plating_color_id=stock.plating_color_id, jig_record=jig_record
         )
 
         modules = {STAGE_DAY_PLANNING: dp_cell}
@@ -557,7 +846,7 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
         modules[STAGE_IP_INSPECTION] = ip_cell
         modules.update(late_cells)
 
-        statuses = {STAGE_DAY_PLANNING: 'Completed' if dp_reached else None}
+        statuses = {STAGE_DAY_PLANNING: dp_status}
         statuses.update(early_statuses)
         statuses[STAGE_JIG_LOADING] = jig_status
         statuses[STAGE_IP_INSPECTION] = ip_status
@@ -565,7 +854,8 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
         module_states = {name: _stage_state(status) for name, status in statuses.items()}
         module_details = {name: _parse_cell_lines(text) for name, text in modules.items()}
 
-        activity = running_out or stock.created_at
+        activity = _latest_time(running_out, early_activity, jig_activity,
+                                batch.date_time, stock.created_at)
 
         # Date-range filter on latest stage activity
         if from_dt and (not activity or activity < from_dt):
@@ -595,21 +885,22 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
             '_activity': activity,
         }
 
-        existing = best_by_stk.get(stk_no)
+        lot_key = ('lot', stock.lot_id) if stock.lot_id else ('stock', stock.pk)
+        existing = rows_by_lot.get(lot_key)
         if (
             existing is None
             or (row['_activity'] and not existing['_activity'])
             or (row['_activity'] and existing['_activity']
                 and row['_activity'] > existing['_activity'])
         ):
-            best_by_stk[stk_no] = row
+            rows_by_lot[lot_key] = row
 
     sentinel = datetime.min
     if tz_aware:
         sentinel = timezone.make_aware(datetime(1, 1, 2))
     rows = sorted(
-        best_by_stk.values(),
-        key=lambda r: r['_activity'] or sentinel,
+        rows_by_lot.values(),
+        key=lambda r: (r['_activity'] or sentinel, r['plating_stk_no']),
         reverse=True,
     )
     for idx, row in enumerate(rows, start=1):

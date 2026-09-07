@@ -898,14 +898,14 @@ box-shadow: 2px 0 8px rgba(0,0,0,0.04);
                     <!-- Process Status Column -->
                     <td >
                       <div class="d-flex">
-                        <!-- Q: Green only for accepted lots -->
+                        <!-- Q: Always green in completed table -->
                         <div
                           title="Tray Scan"
                           class="d-flex align-items-center justify-content-center rounded-circle ms-1"
                           style="
                             width: 25px;
                             height: 25px;
-                            background-color: {% if data.na_qc_accptance %}#0c8249{% else %}#bdbdbd{% endif %};
+                            background-color: #0c8249;
                             color: white;
                             font-weight: bold;
                             line-height: 20px;
@@ -916,21 +916,14 @@ box-shadow: 2px 0 8px rgba(0,0,0,0.04);
                         >
                           Q
                         </div>
-                        <!-- QC: full for accepted/rejected, half for partial rejected -->
+                        <!-- QC: Always green in completed table -->
                         <div
                           title="Tray Scan"
                           class="d-flex align-items-center justify-content-center rounded-circle ms-1"
                           style="
                             width: 25px;
                             height: 25px;
-                            background:
-                              {% if data.na_qc_few_cases_accptance %}
-                                linear-gradient(to right, #0c8249 50%, #bdbdbd 50%);
-                              {% elif data.na_qc_rejection or data.na_qc_accptance %}
-                                #0c8249;
-                              {% else %}
-                                #bdbdbd;
-                              {% endif %}
+                            background: #0c8249;
                             color: white;
                             font-weight: bold;
                             line-height: 20px;

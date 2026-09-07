@@ -312,7 +312,8 @@ SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = 'Lax'
 
 CSRF_COOKIE_HTTPONLY = False
-CSRF_COOKIE_SECURE = True
+# Default to HTTPS cookies; explicitly opt out only for local HTTP development.
+CSRF_COOKIE_SECURE = os.environ.get("DJANGO_COOKIE_SECURE", "true").strip().lower() != "false"
 CSRF_COOKIE_SAMESITE = "Lax"
 
 # SESSION_COOKIE_SECURE = False   # Issue #4: require HTTPS for session cookie
@@ -326,7 +327,7 @@ CSRF_COOKIE_SAMESITE = "Lax"
 # login. DJANGO_SESSION_COOKIE_SECURE lets ops correct this from the
 # deployed .env alone (no code/web.config change) if that turns out to be
 # the case; unset, behavior is unchanged from before.
-SESSION_COOKIE_SECURE = True
+SESSION_COOKIE_SECURE = os.environ.get("DJANGO_COOKIE_SECURE", "true").strip().lower() != "false"
 SESSION_COOKIE_AGE = 900       #15 -minute session timeout (was 86400 sec / 24 h)
 
 # ---------------------------------------------------------------------------

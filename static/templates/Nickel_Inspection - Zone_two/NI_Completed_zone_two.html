@@ -953,14 +953,14 @@ box-shadow: 2px 0 8px rgba(0,0,0,0.04);
                     <!-- Column 12: Process Status -->
                     <td {% if data.nq_hold_lot %} class="row-inactive-blur" {% endif %}>
                       <div class="d-flex">
-                        <!-- Q: Green if nq_qc_accepted_qty_verified, else gray -->
+                        <!-- Q: Always green in completed table -->
                         <div
                           title="Tray Scan"
                           class="d-flex align-items-center justify-content-center rounded-circle ms-1"
                           style="
                             width: 25px;
                             height: 25px;
-                            background-color: {% if data.nq_qc_accepted_qty_verified %}#0c8249{% else %}#bdbdbd{% endif %};
+                            background-color: #0c8249;
                             color: white;
                             font-weight: bold;
                             line-height: 20px;
@@ -971,21 +971,14 @@ box-shadow: 2px 0 8px rgba(0,0,0,0.04);
                         >
                           Q
                         </div>
-                        <!-- QC: Green if nq_qc_rejection or nq_qc_accptance, else gray -->
+                        <!-- QC: Always green in completed table -->
                         <div
                           title="Tray Scan"
                           class="d-flex align-items-center justify-content-center rounded-circle ms-1"
                           style="
                             width: 25px;
                             height: 25px;
-                            background:
-                              {% if data.nq_onhold_picking or data.nq_draft %}
-                                linear-gradient(to right, #0c8249 50%, #bdbdbd 50%);
-                              {% elif data.nq_qc_rejection or data.nq_qc_accptance or data.nq_qc_few_cases_accptance %}
-                                #0c8249;
-                              {% else %}
-                                #bdbdbd;
-                              {% endif %}
+                            background: #0c8249;
                             color: white;
                             font-weight: bold;
                             line-height: 20px;

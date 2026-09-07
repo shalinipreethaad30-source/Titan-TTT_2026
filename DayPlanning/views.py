@@ -2311,6 +2311,12 @@ class TrayIdScanAPIView(APIView):
                     # Do not update Moved_to_D_Picker, it remains False
                 else:
                     # ✅ NORMAL: Complete tray scanning process
+                    # Persist the shared DP OUT / IS IN event on the existing
+                    # DP transaction rows, atomically with the receiving gate.
+                    transfer_at = now()
+                    DPTrayId_History.objects.filter(
+                        batch_id=batch_instance, lot_id=lot_id
+                    ).update(date=transfer_at)
                     ModelMasterCreation.objects.filter(batch_id=batch_id).update(Moved_to_D_Picker=True)
                     print(f"✅ Normal tray scanning completed - set Moved_to_D_Picker=True")
 
@@ -2591,6 +2597,15 @@ class TopTrayScanAPIView(APIView):
                 ).exclude(tray_id=scanned_tray_id).update(top_tray=False)
 
                 # Complete the tray scanning process by setting Moved_to_D_Picker=True
+                # Completing a delayed top-tray scan is the transfer event,
+                # not the earlier draft/initial tray scan.
+                transfer_at = now()
+                transfer_lot_id = TotalStockModel.objects.filter(
+                    batch_id=batch_instance
+                ).order_by('-created_at', '-pk').values_list('lot_id', flat=True).first()
+                DPTrayId_History.objects.filter(
+                    batch_id=batch_instance, lot_id=transfer_lot_id
+                ).update(date=transfer_at)
                 batch_instance.Moved_to_D_Picker = True
                 batch_instance.save(update_fields=['Moved_to_D_Picker'])
                             

@@ -1360,6 +1360,7 @@
                         data-images='{{ jig_detail.model_images|json_encode }}'
                         data-model-colors='{{ jig_detail.model_colors|json_encode }}'
                         data-model-list='{{ jig_detail.no_of_model_cases|json_encode }}'
+                        data-lot-qty="{{ jig_detail.display_lot_qty|default:jig_detail.total_cases_loaded|default:jig_detail.original_lot_qty|default:0 }}"
                         data-plating-stk-nos='{{ jig_detail.final_plating_stk_nos|default:"" }}'>
                         {% if jig_detail.is_multi_model and jig_detail.no_of_model_cases_str %}
                             <div class="multi-model-circles-container mm-gallery-trigger" data-lot-id="{{ jig_detail.lot_id }}" title="Click to view all models" style="cursor:pointer;display:flex;flex-wrap:wrap;align-items:center;gap:3px;max-width:120px;">
@@ -2634,6 +2635,8 @@
            // Get plating stk nos string from data attribute (comma-separated for multi-lot)
            var platingStkNosRaw = (cell.getAttribute('data-plating-stk-nos') || '').trim();
            var platingStkNosArr = platingStkNosRaw ? platingStkNosRaw.split(',').map(function(s){return s.trim();}) : [];
+           var rowLotQty = parseInt(cell.getAttribute('data-lot-qty') || '0', 10);
+           if (isNaN(rowLotQty)) rowLotQty = 0;
 
            // Compose a synthetic mmAlloc array for unified rendering
            // modelList entries are in "modelname:qty" format (e.g. "1805NAR02:29")
@@ -2641,8 +2644,8 @@
              // Parse "modelname:qty" format
              var parts = String(modelEntry).split(':');
              var actualModelName = parts[0].trim();
-             var qty = parts.length > 1 ? parseInt(parts[1], 10) : 0;
-             if (isNaN(qty)) qty = 0;
+             var qty = parts.length > 1 ? parseInt(parts[1], 10) : (modelList.length === 1 ? rowLotQty : 0);
+             if (isNaN(qty)) qty = modelList.length === 1 ? rowLotQty : 0;
 
              // Look up images using just the model name (key in data-images)
              var imgData = modelImages[actualModelName];
