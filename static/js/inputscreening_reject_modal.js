@@ -423,7 +423,20 @@
 
   function applySlotPlan(data) {
     state.isPlanStale = false;
-    state.rejectSlots = data.reject_slots || [];
+
+    // Partial reject tray first; full reject trays below.
+    var rejectPairs = (data.reject_slots || []).map(function (slot, i) {
+      return { slot: slot, scan: state.rejectScans[i] || null, originalIndex: i };
+    });
+    rejectPairs.sort(function (a, b) {
+      var aq = Number(a.slot && a.slot.qty != null ? a.slot.qty : 0);
+      var bq = Number(b.slot && b.slot.qty != null ? b.slot.qty : 0);
+      if (aq !== bq) return aq - bq;
+      return a.originalIndex - b.originalIndex;
+    });
+    state.rejectSlots = rejectPairs.map(function (p) { return p.slot; });
+    state.rejectScans = rejectPairs.map(function (p) { return p.scan; });
+
     state.acceptSlots = data.accept_slots || [];
     state.emptiedTrayIds = (data.emptied_tray_ids || []).map(function (t) {
       return (t || "").toUpperCase();
@@ -434,9 +447,6 @@
       delinkAvailable: data.delink_available || 0,
     };
 
-    state.rejectScans = state.rejectSlots.map(function (_, i) {
-      return state.rejectScans[i] || null;
-    });
     state.acceptScans = state.acceptSlots.map(function (_, i) {
       return state.acceptScans[i] || null;
     });
@@ -633,7 +643,7 @@
     var html = state.delinkScans.map(function (d, i) {
       return '<div class="isrm-delink-row" style="margin-bottom:6px;">' +
         '<span class="isrm-alloc-num">' + (i + 1) + '</span>' +
-        '<input type="text" class="isrm-scan-input" value="' + escHtml(d.tray_id) + '" readonly />' +
+        '<input type="text" class="isrm-scan-input" data-delink-idx="' + i + '" value="' + escHtml(d.tray_id) + '" readonly />' +
         '</div>';
     }).join("");
 
@@ -676,6 +686,20 @@
       // Re-validate when user finishes editing
       inp.addEventListener("blur", function () {
         var v = (this.value || "").trim().toUpperCase();
+
+        if (!v) {
+          var delinkIdx = parseInt(this.getAttribute("data-delink-idx"), 10);
+          if (!isNaN(delinkIdx) && state.delinkScans[delinkIdx]) {
+            state.delinkScans.splice(delinkIdx, 1);
+            renderDelinkSection();
+            renderActivePills();
+            updateReuseCounter();
+            updateSubmitState();
+            setInsight("info", "Delink tray cleared. Tray is available to tap again.");
+          }
+          return;
+        }
+
         if (v.length === TRAY_ID_LEN) {
           attemptScan(this, "delink", v);
         }
@@ -689,6 +713,59 @@
       this.value = (this.value || "").toUpperCase();
       this.classList.remove("invalid");
       var v = this.value.trim();
+
+      // Keep active-tray pill state in sync when a previously-filled tray ID
+      // is manually erased. Release only the matching in-memory scan slot;
+      // existing backend validation and allocation rules are unchanged.
+      if (!v) {
+        var slotIdx = this.getAttribute("data-slot-idx");
+        if (slotIdx !== null && slotIdx !== undefined) {
+          var idx = parseInt(slotIdx, 10);
+
+          if (slotType === "reject" && state.rejectScans[idx]) {
+            state.rejectScans[idx] = null;
+
+            // Reject is the first allocation phase. Once a reject tray is
+            // manually removed, downstream delink/accept assignments are no
+            // longer safe to keep. Release them so their active-tray pills
+            // become tappable again and the normal Reject -> Delink -> Accept
+            // flow can resume from the current state.
+            state.delinkScans = [];
+            state.acceptScans = state.acceptSlots.map(function () { return null; });
+
+            renderRejectRows();
+            renderDelinkSection();
+            renderAcceptRows();
+            renderActivePills();
+            updateReuseCounter();
+            updateSubmitState();
+            setInsight("info", "Reject tray cleared. Dependent trays released for tapping.");
+            return;
+          }
+
+          if (slotType === "accept" && state.acceptScans[idx]) {
+            state.acceptScans[idx] = null;
+
+            // Accept slot 0 is the user-selected top/partial tray and controls
+            // the existing auto-fill cascade for slots 1+. If the top tray is
+            // manually removed, release those dependent auto-filled accept
+            // assignments too so their pills immediately become tappable.
+            if (idx === 0) {
+              for (var ai = 1; ai < state.acceptScans.length; ai++) {
+                state.acceptScans[ai] = null;
+              }
+            }
+
+            renderAcceptRows();
+            renderActivePills();
+            updateReuseCounter();
+            updateSubmitState();
+            setInsight("info", "Accept tray cleared. Tray is available to tap again.");
+            return;
+          }
+        }
+      }
+
       if (v.length > 0 && v.length < TRAY_ID_LEN) {
         setInsight("busy", "Typing " + slotType + " tray (" + v.length + "/" + TRAY_ID_LEN + ")…");
       }

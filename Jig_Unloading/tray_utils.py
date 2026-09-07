@@ -379,6 +379,7 @@ def find_jig_unload_tray_conflict(raw_tray_id, allowed_lot_ids=None, include_tra
 
     from modelmasterapp.models import TrayId
     from Jig_Unloading.models import JigUnload_TrayId, JigUnloadDraft, JigUnloadAutoSave, JUSubmittedZ1
+    from Jig_Loading.models import ExcessLotTray
 
     # A tray that has been officially delinked in the TrayId master (CLAUDE.md
     # §7 "Delink Rules" — the authoritative state update) is free for reuse even
@@ -391,6 +392,25 @@ def find_jig_unload_tray_conflict(raw_tray_id, allowed_lot_ids=None, include_tra
     master_delinked = TrayId.objects.filter(
         _variant_query('tray_id', tray_variants), delink_tray=True
     ).exists()
+
+    if include_tray_master:
+        for excess_tray in ExcessLotTray.objects.filter(_variant_query('tray_id', tray_variants)).select_related(
+            'excess_lot'
+        ).only(
+            'id', 'tray_id', 'lot_id', 'qty', 'excess_lot__new_lot_id', 'excess_lot__parent_lot_id'
+        ):
+            record_lots = _lot_id_aliases(excess_tray.lot_id)
+            excess_lot = getattr(excess_tray, 'excess_lot', None)
+            if excess_lot:
+                record_lots.update(_lot_id_aliases(excess_lot.new_lot_id))
+            if _has_allowed_lot(record_lots, allowed_aliases):
+                continue
+            return _make_tray_conflict(
+                tray_id,
+                'Jig Loading excess tray',
+                next(iter(record_lots), ''),
+                excess_tray.id,
+            )
 
     if include_tray_master:
         for tray in TrayId.objects.filter(_variant_query('tray_id', tray_variants)).only(

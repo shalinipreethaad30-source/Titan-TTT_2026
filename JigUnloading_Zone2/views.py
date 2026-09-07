@@ -3513,6 +3513,7 @@ def JU_Zone_save_jig_unload_draft(request):
             tray_conflict = find_jig_unload_tray_conflict(
                 tray_id,
                 allowed_lot_ids=allowed_lot_ids_for_trays,
+                include_tray_master=True,
             )
             if tray_conflict:
                 return JsonResponse({
@@ -3712,6 +3713,7 @@ def JU_Zone_validate_tray_id(request):
     tray_conflict = find_jig_unload_tray_conflict(
         tray_id,
         allowed_lot_ids=allowed_lot_ids_for_trays,
+        include_tray_master=True,
     )
     if tray_conflict:
         return JsonResponse({
@@ -4044,6 +4046,7 @@ def JU_Zone_validate_tray_id_dynamic(request):
         tray_conflict = find_jig_unload_tray_conflict(
             tray_id,
             allowed_lot_ids=allowed_lot_ids_for_trays,
+            include_tray_master=True,
         )
         if tray_conflict:
             return JsonResponse({
@@ -4295,24 +4298,101 @@ def JU_Zone_check_unload_status(request):
 @method_decorator(csrf_exempt, name='dispatch')
 class JU_Zone_ListAPIView(APIView):
     def get(self, request):
-        lot_id = request.GET.get('lot_id')
+        lot_id = request.GET.get('lot_id', '').strip()
         if not lot_id:
             return JsonResponse({'success': False, 'error': 'Missing lot_id'}, status=400)
 
-        trays = JigUnload_TrayId.objects.filter(lot_id=lot_id).order_by('id')
-        tray_list = [
-            {
-                'tray_id': tray.tray_id,
-                'tray_quantity': tray.tray_qty,
-                'top_tray': tray.top_tray
-            }
-            for tray in trays
-        ]
+        try:
+            record = JigUnloadAfterTable.objects.filter(lot_id=lot_id).first()
+            if not record:
+                return JsonResponse({
+                    'success': False,
+                    'error': f'Record not found for lot_id: {lot_id}'
+                }, status=404)
 
-        return JsonResponse({
-            'success': True,
-            'trays': tray_list
-        })
+            combine_lot_ids = [
+                _zone2_extract_lot_id(src_lot)
+                for src_lot in (record.combine_lot_ids or [])
+            ]
+            combine_lot_ids = _zone2_ordered_unique(combine_lot_ids)
+
+            if not combine_lot_ids:
+                return JsonResponse({
+                    'success': False,
+                    'error': 'No combine_lot_ids found'
+                }, status=404)
+
+            tray_list = []
+
+            # Primary source: saved unload tray snapshot.
+            # Zone 2 completed rows pass the generated UNLOT id, while tray
+            # snapshots are saved against the original/source lot ids.
+            subs = list(
+                JUSubmittedZ1.objects
+                .filter(lot_id__in=combine_lot_ids, is_draft=False)
+                .order_by('id')
+            )
+
+            canonical_subs = []
+            exact_total_matches = [
+                sub for sub in subs
+                if int(sub.total_qty or 0) == int(record.total_case_qty or 0)
+            ]
+            if exact_total_matches:
+                canonical_subs = [exact_total_matches[0]]
+            else:
+                seen_signatures = set()
+                for sub in subs:
+                    signature = _zone2_submission_tray_signature(sub.tray_data)
+                    if signature and signature in seen_signatures:
+                        continue
+                    seen_signatures.add(signature)
+                    canonical_subs.append(sub)
+
+            for sub in canonical_subs:
+                for entry in (sub.tray_data or []):
+                    if not isinstance(entry, dict):
+                        continue
+                    tray_list.append({
+                        'tray_id': entry.get('tray_id', ''),
+                        'tray_quantity': (
+                            entry.get('qty')
+                            or entry.get('tray_qty')
+                            or entry.get('tray_quantity')
+                            or entry.get('original_qty')
+                            or 0
+                        ),
+                        'top_tray': (
+                            entry.get('is_top_tray')
+                            if entry.get('is_top_tray') is not None
+                            else entry.get('top_tray', False)
+                        ),
+                        'source_jig': sub.jig_qr_id or 'N/A',
+                    })
+
+            # Fallback: old JigUnload_TrayId storage.
+            if not tray_list:
+                trays = JigUnload_TrayId.objects.filter(lot_id__in=combine_lot_ids).order_by('id')
+                for tray in trays:
+                    tray_list.append({
+                        'tray_id': tray.tray_id,
+                        'tray_quantity': tray.tray_qty,
+                        'top_tray': tray.top_tray,
+                        'source_jig': 'N/A',
+                    })
+
+            return JsonResponse({
+                'success': True,
+                'combine_lot_ids': combine_lot_ids,
+                'trays': tray_list
+            })
+
+        except Exception as e:
+            logger.error(f"Error in JU_Zone_ListAPIView for lot_id={lot_id}: {str(e)}", exc_info=True)
+            return JsonResponse({
+                'success': False,
+                'error': 'Unable to process the request. Please verify the submitted data and try again.'
+            }, status=500)
 
 
 class JU_Zone_Completedtable(LoginRequiredMixin, TemplateView):
@@ -5872,6 +5952,7 @@ def JU_Zone_autosave_jig_unload(request):
                 tray_conflict = find_jig_unload_tray_conflict(
                     tray_id,
                     allowed_lot_ids=allowed_lot_ids_for_trays,
+                    include_tray_master=True,
                 )
                 if tray_conflict:
                     return JsonResponse({

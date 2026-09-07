@@ -2854,7 +2854,14 @@ document.addEventListener('DOMContentLoaded', function() {
           const currentLotId = (currentModelsData && currentModelsData.models && currentModelsData.models[currentModelIndex])
             ? (currentModelsData.models[currentModelIndex].lot_id || '') : '';
           fetch('/jig_unloading/api/validate_tray_occupancy_z1/?tray_id=' + encodeURIComponent(currentVal) + '&lot_id=' + encodeURIComponent(currentLotId))
-            .then(function(r) { return r.json(); })
+            .then(function(r) {
+              return r.json().catch(function() {
+                return {
+                  success: false,
+                  error: 'Tray validation failed. Please try again.'
+                };
+              });
+            })
             .then(function(data) {
               if (!data.success) {
                 trayInput.style.borderColor = '#ef5350';
@@ -2873,10 +2880,13 @@ document.addEventListener('DOMContentLoaded', function() {
             })
             .catch(function(err) {
               console.error('Tray validation error:', err);
-              trayInput.style.borderColor = '#66bb6a';
-              trayInput.style.boxShadow = '0 0 0 2px rgba(102,187,106,0.15)';
-              showTrayError('\u2705 Tray ' + currentVal + ' accepted', 'success');
-              focusNextEmptyTrayInput(i);
+              trayInput.style.borderColor = '#ef5350';
+              trayInput.style.boxShadow = '0 0 0 2px rgba(239,83,80,0.15)';
+              showTrayError('Tray validation failed. Please try again.');
+              trayInput.value = '';
+              trayInput.style.borderColor = '#cfd8dc';
+              trayInput.style.boxShadow = '';
+              trayInput.focus();
             });
         } else if (val.length > 0) {
           this.style.borderColor = '#80cbc4';

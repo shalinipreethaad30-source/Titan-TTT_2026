@@ -195,6 +195,13 @@ class SafeSessionMiddleware(DjangoSessionMiddleware):
     """
 
     def process_response(self, request, response):
+        # The session heartbeat is a presence/single-session check only.
+        # Do not let this background request refresh the sliding Django session
+        # when SESSION_SAVE_EVERY_REQUEST=True; otherwise the 5-second heartbeat
+        # can keep an idle user's authentication session alive indefinitely.
+        if request.path == '/adminportal/api/session-heartbeat/':
+            return response
+
         try:
             return super().process_response(request, response)
         except SessionInterrupted:
@@ -691,10 +698,25 @@ class SecurityHeadersMiddleware:
             ),
         )
 
-        # Prevent browsers from caching authenticated HTML pages.
+        # Prevent browsers from caching sensitive responses (VAPT / Burp
+        # finding "Cacheable HTTPS response"). Covers authenticated HTML pages
+        # AND the JSON API under /adminportal/api/ and /api/ (user list,
+        # group-module maps, shortcuts, heartbeat, …) which previously carried
+        # no Cache-Control at all and could be stored in the browser cache.
         content_type = response.get('Content-Type', '')
-        if 'text/html' in content_type:
-            response.setdefault('Cache-Control', 'no-store, no-cache, must-revalidate, private')
+        path = request.path or ''
+        is_sensitive = (
+            'text/html' in content_type
+            or 'application/json' in content_type
+            or path.startswith('/adminportal/api/')
+            or path.startswith('/api/')
+        )
+        if is_sensitive:
+            # Direct assignment (not setdefault) so an upstream max-age is
+            # overridden. Pragma + Expires satisfy the HTTP/1.0 checks too.
+            response['Cache-Control'] = 'no-store, no-cache, must-revalidate, private'
+            response['Pragma'] = 'no-cache'
+            response['Expires'] = '0'
 
         return response
 

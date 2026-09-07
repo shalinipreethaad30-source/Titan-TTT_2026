@@ -26,7 +26,7 @@
   var RECHECK_INTERVAL_MS = 30000;              // fallback re-check cadence
   var alertShown = false;
   var idleTimerId = null;
-  var lastActivityAt = Date.now();              // last server round-trip
+  var lastActivityAt = Date.now();              // last genuine user activity
   var checkInFlight = false;
 
   function redirectToLogin() {
@@ -93,12 +93,10 @@
       return nativeFetch.apply(null, arguments).then(function (response) {
         if (isSessionExpiredResponse(response)) {
           handlePossiblyExpired(response);
-        } else {
-          // Any successful server round-trip refreshes the sliding session
-          // (SESSION_SAVE_EVERY_REQUEST) — restart the idle countdown.
-          lastActivityAt = Date.now();
-          scheduleIdleCheck(getExpirySeconds() * 1000 + IDLE_BUFFER_MS);
         }
+        // Do NOT treat background/server traffic as user activity.
+        // Automatic polling/fetch calls must not postpone the 15-minute
+        // inactivity alert. Only genuine user interaction resets the timer.
         return response;
       });
     };
@@ -121,9 +119,9 @@
   // not the full idle-session timeout (backend: services.get_active_session_
   // conflict_message / ACTIVE_SESSION_STALE_SECONDS) ────────────────────────
   function getCsrfToken() {
-    var match = document.cookie.match(/(?:^|;\s*)csrftoken=([^;]+)/);
-    return match ? decodeURIComponent(match[1]) : '';
-  }
+    var tokenInput = document.querySelector('[name="csrfmiddlewaretoken"]');
+    return tokenInput ? tokenInput.value : '';
+}
 
   function sendHeartbeat() {
     if (alertShown || !nativeFetch) { return; }
@@ -157,33 +155,32 @@
   function scheduleIdleCheck(delayMs) {
     if (alertShown) { return; }
     if (idleTimerId) { clearTimeout(idleTimerId); }
-    idleTimerId = setTimeout(checkSessionAlive, delayMs);
+    idleTimerId = setTimeout(checkIdleTimeout, delayMs);
   }
 
-  function checkSessionAlive() {
-    if (alertShown || !nativeFetch || checkInFlight) { return; }
-    checkInFlight = true;
-    // Uses the raw fetch so this probe itself doesn't reschedule the timer;
-    // 401 handling is done explicitly here.
-    nativeFetch(PING_URL, {
-      method: 'GET',
-      headers: { 'Accept': 'application/json' },
-      credentials: 'same-origin'
-    }).then(function (response) {
-      checkInFlight = false;
-      if (isSessionExpiredResponse(response)) {
-        handlePossiblyExpired(response);
-      } else {
-        // Session still valid — this ping itself refreshed the sliding
-        // session, so a full idle window starts again.
-        lastActivityAt = Date.now();
-        scheduleIdleCheck(RECHECK_INTERVAL_MS);
-      }
-    }).catch(function () {
-      checkInFlight = false;
-      // Network hiccup: retry later rather than falsely logging the user out.
-      scheduleIdleCheck(RECHECK_INTERVAL_MS);
-    });
+  function checkIdleTimeout() {
+    if (alertShown) { return; }
+
+    var expiryMs = getExpirySeconds() * 1000;
+    var idleMs = Date.now() - lastActivityAt;
+
+    if (idleMs >= expiryMs) {
+      // The inactivity policy is based on genuine user interaction, not on
+      // background polling. Show the re-login alert as soon as the configured
+      // inactivity window has elapsed.
+      showSessionExpiredAlert();
+      return;
+    }
+
+    // Timer throttling/background-tab delays can make this callback run early
+    // or after user activity. Schedule only the remaining idle duration.
+    scheduleIdleCheck((expiryMs - idleMs) + IDLE_BUFFER_MS);
+  }
+
+  function recordUserActivity() {
+    if (alertShown) { return; }
+    lastActivityAt = Date.now();
+    scheduleIdleCheck(getExpirySeconds() * 1000 + IDLE_BUFFER_MS);
   }
 
   // Browsers heavily throttle setTimeout in background tabs, so the timer
@@ -193,7 +190,7 @@
     if (alertShown) { return; }
     var idleMs = Date.now() - lastActivityAt;
     if (idleMs >= getExpirySeconds() * 1000) {
-      checkSessionAlive();
+      showSessionExpiredAlert();
     }
   }
 
@@ -203,6 +200,13 @@
     lastActivityAt = Date.now();
     scheduleIdleCheck(getExpirySeconds() * 1000 + IDLE_BUFFER_MS);
     startHeartbeat();
+
+    // Reset the inactivity window only for genuine user interaction.
+    // Passive/background fetches, polling and heartbeat traffic are excluded.
+    ['mousedown', 'keydown', 'touchstart', 'scroll'].forEach(function (eventName) {
+      document.addEventListener(eventName, recordUserActivity, { passive: true });
+    });
+
     document.addEventListener('visibilitychange', function () {
       if (!document.hidden) { checkNowIfOverdue(); }
     });

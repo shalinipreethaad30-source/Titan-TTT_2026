@@ -2769,20 +2769,25 @@ document.addEventListener("DOMContentLoaded", function() {
         reuseInfo.style.display = 'none';
       }
 
-      origContainer.querySelectorAll('span[data-tray-id]').forEach(function (chip) {
-        setChipDelinkState(chip.dataset.trayId, delinkRows.some(function (row) { return row.tray_id === chip.dataset.trayId; }));
-      });
+      // Keep original tray chips in sync with what is actually assigned
+      // across Reject / Delink / Accept. Clearing or replacing a tray ID must
+      // immediately make the removed tray tappable again.
+      syncOriginalTrayChipStates();
 
       var delinkedIdSet = delinkRows.map(function (row) { return row.tray_id; });
       var filteredAutoTrays = (state.acceptAutoTrays || []).filter(function (t) {
         return delinkedIdSet.indexOf(t.tray_id) === -1;
+      }).sort(function (a, b) {
+        return String(a.tray_id || '').localeCompare(String(b.tray_id || ''));
       });
       var accInputs = Array.from(acceptSlotsCont.querySelectorAll('.na-acc-tray-input'));
       var slot0Val = accInputs.length > 0 ? accInputs[0].value.trim().toUpperCase() : '';
       if (!slot0Val) {
         for (var j = 1; j < accInputs.length; j++) accInputs[j].value = '';
       } else {
-        var filteredForRest = filteredAutoTrays.filter(function (t) { return t.tray_id !== slot0Val; });
+        var filteredForRest = filteredAutoTrays.filter(function (t) { return t.tray_id !== slot0Val; }).sort(function (a, b) {
+          return String(a.tray_id || '').localeCompare(String(b.tray_id || ''));
+        });
         var availSlots = accInputs.length - 1;
         filteredForRest.slice(0, availSlots).forEach(function (t, i) {
           accInputs[i + 1].value = t.tray_id;
@@ -2792,6 +2797,25 @@ document.addEventListener("DOMContentLoaded", function() {
         }
       }
       applyScanLockAndOrder();
+    }
+
+    function syncOriginalTrayChipStates() {
+      var usedOriginalIds = []
+        .concat(Array.from(rejectSlotsCont.querySelectorAll('.na-rej-tray-input')).map(function (inp) {
+          return inp.value.trim().toUpperCase();
+        }))
+        .concat(Array.from(delinkList.querySelectorAll('.na-delink-tray-input')).map(function (inp) {
+          return inp.value.trim().toUpperCase();
+        }))
+        .concat(Array.from(acceptSlotsCont.querySelectorAll('.na-acc-tray-input')).map(function (inp) {
+          return inp.value.trim().toUpperCase();
+        }))
+        .filter(Boolean);
+
+      origContainer.querySelectorAll('span[data-tray-id]').forEach(function (chip) {
+        var trayId = String(chip.dataset.trayId || '').trim().toUpperCase();
+        setChipDelinkState(trayId, usedOriginalIds.indexOf(trayId) !== -1);
+      });
     }
 
     // Strict one-by-one gate: Reject must be fully scanned before Delink unlocks;
@@ -2837,9 +2861,12 @@ document.addEventListener("DOMContentLoaded", function() {
 
       var chipsLocked = isFullLot || (lockDelink && lockAccept);
       origContainer.querySelectorAll('span[data-tray-id]').forEach(function (chip) {
-        chip.style.pointerEvents = chipsLocked ? 'none' : '';
+        var chipSelected = chip.dataset.selected === '1';
+        var chipDisabled = chipsLocked || chipSelected;
+        chip.style.pointerEvents = chipDisabled ? 'none' : '';
+        chip.style.cursor = chipDisabled ? 'not-allowed' : 'pointer';
         chip.style.filter = chipsLocked ? 'grayscale(1)' : '';
-        chip.style.opacity = chipsLocked ? '0.45' : (chip.dataset.selected === '1' ? '0.7' : '1');
+        chip.style.opacity = chipsLocked ? '0.45' : (chipSelected ? '0.7' : '1');
       });
       applyFullLotRejectionLock();
     }
@@ -3075,11 +3102,39 @@ document.addEventListener("DOMContentLoaded", function() {
       });
 
       rejectSlotsCont.querySelectorAll('.na-rej-tray-input').forEach(function (inp) {
-        inp.addEventListener('input', applyScanLockAndOrder);
+        inp.addEventListener('input', function () {
+          syncOriginalTrayChipStates();
+          applyScanLockAndOrder();
+        });
       });
       acceptSlotsCont.querySelectorAll('.na-acc-tray-input').forEach(function (inp) {
-        inp.addEventListener('input', applyScanLockAndOrder);
+        inp.addEventListener('input', function () {
+          var accInputs = Array.from(acceptSlotsCont.querySelectorAll('.na-acc-tray-input'));
+          var currentIndex = accInputs.indexOf(this);
+
+          // Accept trays are sequential. If a tray is manually removed from
+          // any position, clear that slot and every slot below it so no stale
+          // later assignments remain. Those cleared original trays become
+          // available to tap again immediately.
+          if (!this.value.trim() && currentIndex !== -1) {
+            for (var i = currentIndex; i < accInputs.length; i++) {
+              accInputs[i].value = '';
+              accInputs[i].style.borderColor = '';
+            }
+            errDiv.textContent = '';
+          }
+
+          syncOriginalTrayChipStates();
+          applyScanLockAndOrder();
+        });
       });
+      delinkList.querySelectorAll('.na-delink-tray-input').forEach(function (inp) {
+        inp.addEventListener('input', function () {
+          syncOriginalTrayChipStates();
+          applyScanLockAndOrder();
+        });
+      });
+      syncOriginalTrayChipStates();
       applyScanLockAndOrder();
       applyFullLotRejectionLock();
 

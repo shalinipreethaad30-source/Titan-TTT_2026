@@ -281,4 +281,3 @@ class NickelAudit_AQLSamplingPlan(AQLSamplingPlan):
         app_label = 'Nickel_Audit'
         verbose_name = 'AQL Sampling Plan'
         verbose_name_plural = 'AQL Sampling Plans'
-

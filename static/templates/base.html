@@ -220,7 +220,7 @@
             type scale as their submenu links. */
          @media (min-width: 768px) and (max-width: 1024px) {
          .sidebar .nav:not(.sub-menu) > .nav-item > .nav-link .menu-title {
-         font-size: 22px !important;
+        font-size: 22px !important;
          }
          /* Tablet-only: bump the sidebar circle-badge letters (D, DP, IS, BQ...)
             a little larger for readability. Base is 8.5px; +2px here.
@@ -1369,23 +1369,26 @@
           left: 50%;
           transform: translateX(-50%);
           z-index: 300000;
-          background: #1e293b;
-          color: #fff;
+          background: #020617;
+          color: #ffffff !important;
           text-align: center;
-          padding: 10px 20px;
-          border-radius: 999px;
-          font-size: 13px;
-          font-weight: 600;
-          letter-spacing: 0.2px;
-          box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+          padding: 12px 20px;
+          border-radius: 10px;
+          font-size: 14px;
+          border: 1px solid #475569;
+          box-shadow: 0 12px 30px rgba(2, 6, 23, 0.55);
           align-items: center;
           gap: 8px;
+          max-width: calc(100vw - 32px);
         }
         .network-banner.show { display: flex; }
+        .network-banner-message { line-height: 1.35; }
+        .network-banner-title { display: block; color: #ffffff !important; font-weight: 700; }
+        .network-banner-description { display: block; color: #e2e8f0 !important; font-size: 12px; opacity: 1; }
         .network-banner-dot {
           width: 8px; height: 8px;
           border-radius: 50%;
-          background: #dc2626;
+          background: #f43f5e;
           flex-shrink: 0;
           animation: network-pulse 1.2s ease-in-out infinite;
         }
@@ -1396,9 +1399,12 @@
       </style>
    </head>
    <body class="sidebar-icon-only{% block body_extra_class %}{% endblock %}">
-      <div id="network-status-banner" class="network-banner">
+      <div id="network-status-banner" class="network-banner" role="status" aria-live="assertive" aria-atomic="true">
         <span class="network-banner-dot"></span>
-        Network is too slow
+        <span class="network-banner-message">
+          <span class="network-banner-title">No Network Connection</span>
+          <span class="network-banner-description">Please check your network connection.</span>
+        </span>
       </div>
       {% csrf_token %}
       <!--Global Buffering -->
@@ -5633,53 +5639,27 @@
 
 <script src="{% static 'js/sop_viewer.js' %}" nonce="{{ csp_nonce }}"></script>
 
-<!-- Network stability monitor -->
+<!-- Device network status monitor -->
 <script nonce="{{ csp_nonce }}">
 (function () {
   var banner = document.getElementById('network-status-banner');
-  var PING_URL = '/adminportal/api/network-ping/';
-  var SLOW_THRESHOLD_MS = 2000;
-  var CHECK_INTERVAL_MS = 8000;
-  var CONSECUTIVE_SLOW_TO_SHOW = 2;
-  var consecutiveSlow = 0;
-  var checking = false;
+  if (!banner) return;
 
   function showBanner() { banner.classList.add('show'); }
-  function hideBanner() { banner.classList.remove('show'); consecutiveSlow = 0; }
+  function hideBanner() { banner.classList.remove('show'); }
 
-  function checkNetwork() {
-    if (checking) return;
-    checking = true;
-
-    if (!navigator.onLine) {
+  function updateNetworkStatus() {
+    if (navigator.onLine) {
+      hideBanner();
+    } else {
       showBanner();
-      checking = false;
-      return;
     }
-
-    var start = performance.now();
-    fetch(PING_URL, { method: 'GET', cache: 'no-store', credentials: 'same-origin' })
-      .then(function (res) {
-        var elapsed = performance.now() - start;
-        if (!res.ok || elapsed > SLOW_THRESHOLD_MS) {
-          consecutiveSlow++;
-          if (consecutiveSlow >= CONSECUTIVE_SLOW_TO_SHOW) { showBanner(); }
-        } else {
-          hideBanner();
-        }
-      })
-      .catch(function () {
-        consecutiveSlow++;
-        if (consecutiveSlow >= CONSECUTIVE_SLOW_TO_SHOW) { showBanner(); }
-      })
-      .finally(function () { checking = false; });
   }
 
-  window.addEventListener('online', checkNetwork);
+  window.addEventListener('online', updateNetworkStatus);
   window.addEventListener('offline', showBanner);
 
-  checkNetwork();
-  setInterval(checkNetwork, CHECK_INTERVAL_MS);
+  updateNetworkStatus();
 })();
 </script>
 

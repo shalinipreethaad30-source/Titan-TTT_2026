@@ -2783,12 +2783,12 @@ document.addEventListener('DOMContentLoaded', function() {
       // AQL auto-trigger: if rejection qty exceeds AQL limit, force Full Lot Rejection
       if (_aqlLimit > 0 && totalReject > _aqlLimit && !fullLotCb.checked) {
         fullLotCb.checked = true;
-        // Clear reason inputs — full lot rejection does not use per-reason qty
-        reasonsGrid.querySelectorAll('.reject-qty-input').forEach(function(inp) { inp.value = ''; });
-        allocationSection.style.display = 'none';
-        _acceptSlots = [];
-        _rejectSlots = [];
-        _delinkSlots = [];
+
+        // Apply the same behavior as manually selecting Full Lot Rejection.
+        // The existing change handler clears/disables all rejection reason inputs,
+        // hides tray allocation, and clears any pending tray slot state.
+        fullLotCb.dispatchEvent(new Event('change'));
+
         // Show banner and focus remarks
         errorDiv.style.color = '#c62828';
         errorDiv.textContent =
@@ -2796,7 +2796,6 @@ document.addEventListener('DOMContentLoaded', function() {
           '). Full Lot Rejection has been auto-selected. Please enter a remark.';
         remarksInput.style.border = '2px solid #c62828';
         remarksInput.focus();
-        updateTotals(); // re-run with checkbox now checked to sync display
         return;
       }
 
@@ -3283,7 +3282,9 @@ document.addEventListener('DOMContentLoaded', function() {
           targetSlots[idx].tray_id = null;
           if (slotType === 'reject') {
             _delinkSlots = [];
-            _acceptSlots.forEach(function(s) { if (!s.is_top) s.tray_id = null; });
+            // Reject allocation changed/cleared: all Accept tray assignments depend on it,
+            // including the Top tray. Do not keep any stale Accept tray ID.
+            _acceptSlots.forEach(function(s) { s.tray_id = null; });
           }
           if (slotType === 'accept' && targetSlots[idx].is_top) {
             _acceptSlots.forEach(function(s) { if (!s.is_top) s.tray_id = null; });
@@ -3443,18 +3444,60 @@ document.addEventListener('DOMContentLoaded', function() {
           if (this.value !== val) { var pos = this.selectionStart; this.value = val; this.setSelectionRange(pos, pos); }
           var errSpan = this.closest('td').querySelector('.slot-scan-error');
           if (!errSpan) return;
-          if (!val) { errSpan.style.display = 'none'; return; }
-          if (val.length < 9) { errSpan.style.display = 'none'; return; }
           var idx = parseInt(this.getAttribute('data-idx'), 10);
           var slotType = this.getAttribute('data-type');
           var targetSlots = slotType === 'accept' ? _acceptSlots : _rejectSlots;
           var targetContainer = slotType === 'accept' ? acceptSlotsContainer : rejectSlotsContainer;
+
           var originalVal = targetSlots[idx].tray_id;
+
+          // Manual clear must release the tray immediately, same as Clear/Enter-empty.
+          if (!val) {
+            errSpan.style.display = 'none';
+            targetSlots[idx].tray_id = null;
+            if (slotType === 'reject') {
+              _delinkSlots = [];
+              // Reject tray is no longer valid, so every dependent Accept tray
+              // (Top + non-top) must be cleared and the Accept phase disabled.
+              _acceptSlots.forEach(function(s) { s.tray_id = null; });
+            }
+            if (slotType === 'accept' && targetSlots[idx].is_top) {
+              _acceptSlots.forEach(function(s) { if (!s.is_top) s.tray_id = null; });
+            }
+            renderSlots(targetContainer, targetSlots, slotType);
+            if (slotType === 'reject') {
+              renderSlots(acceptSlotsContainer, _acceptSlots, 'accept');
+            }
+            renderOriginalTrays();
+            if (slotType === 'reject') {
+              checkPhaseTransition();
+            } else {
+              updateSummary();
+            }
+            return;
+          }
+
           if (val === originalVal) { errSpan.style.display = 'none'; return; }
+
+          // IMPORTANT: as soon as a committed Reject tray is edited, invalidate the
+          // old committed state immediately. The visible field is now pending a fresh
+          // validation and must not remain submittable through the old tray ID.
+          if (slotType === 'reject' && originalVal) {
+            targetSlots[idx].tray_id = null;
+            _delinkSlots = [];
+            _acceptSlots.forEach(function(s) { s.tray_id = null; });
+            renderSlots(acceptSlotsContainer, _acceptSlots, 'accept');
+            renderOriginalTrays();
+            checkPhaseTransition();
+          }
+
+          if (val.length < 9) { errSpan.style.display = 'none'; return; }
           // Check duplicate
           targetSlots[idx].tray_id = null;
           var isDup = isAssigned(val);
-          targetSlots[idx].tray_id = originalVal;
+          if (slotType !== 'reject') {
+            targetSlots[idx].tray_id = originalVal;
+          }
           if (isDup) {
             errSpan.textContent = 'Already assigned to another slot';
             errSpan.style.display = 'block'; errSpan.style.color = '#c62828';
@@ -3465,7 +3508,10 @@ document.addEventListener('DOMContentLoaded', function() {
           if (slotType === 'reject' && getOriginalIds()[val]) {
             targetSlots[idx].tray_id = null;
             var originalsNow = _rejectSlots.filter(function(s) { return s.tray_id && getOriginalIds()[s.tray_id]; }).length;
-            targetSlots[idx].tray_id = originalVal;
+            // Do not restore the old Reject tray while the replacement is pending/invalid.
+            if (slotType !== 'reject') {
+              targetSlots[idx].tray_id = originalVal;
+            }
             if (originalsNow >= _reuseCount) {
               errSpan.textContent = 'Reuse limit reached (' + _reuseCount + ')';
               errSpan.style.display = 'block'; errSpan.style.color = '#c62828';
@@ -3496,7 +3542,7 @@ document.addEventListener('DOMContentLoaded', function() {
             targetSlots[idx].tray_id = val;
             if (slotType === 'reject') {
               _delinkSlots = [];
-              _acceptSlots.forEach(function(s) { if (!s.is_top) s.tray_id = null; });
+              _acceptSlots.forEach(function(s) { s.tray_id = null; });
             }
             if (slotType === 'accept' && targetSlots[idx].is_top) {
               autoFillAcceptNonTop();
@@ -3531,7 +3577,7 @@ document.addEventListener('DOMContentLoaded', function() {
             targetSlots[idx].tray_id = null;
             if (slotType === 'reject') {
               _delinkSlots = [];
-              _acceptSlots.forEach(function(s) { if (!s.is_top) s.tray_id = null; });
+              _acceptSlots.forEach(function(s) { s.tray_id = null; });
             }
             if (slotType === 'accept' && targetSlots[idx].is_top) {
               _acceptSlots.forEach(function(s) { if (!s.is_top) s.tray_id = null; });
@@ -3548,6 +3594,17 @@ document.addEventListener('DOMContentLoaded', function() {
 
           if (newVal === originalVal) return; // No change
 
+          // A changed Reject tray must immediately invalidate the previously committed
+          // tray and every Accept assignment derived from it. Fresh validation is required.
+          if (slotType === 'reject' && originalVal) {
+            targetSlots[idx].tray_id = null;
+            _delinkSlots = [];
+            _acceptSlots.forEach(function(s) { s.tray_id = null; });
+            renderSlots(acceptSlotsContainer, _acceptSlots, 'accept');
+            renderOriginalTrays();
+            checkPhaseTransition();
+          }
+
           // Duplicate check (exclude current slot's own ID)
           var dupFound = false;
           _acceptSlots.concat(_rejectSlots).forEach(function(s, i) {
@@ -3556,7 +3613,9 @@ document.addEventListener('DOMContentLoaded', function() {
           // Simpler: isAssigned checks all slots; temporarily clear this slot
           targetSlots[idx].tray_id = null;
           var isDup = isAssigned(newVal);
-          targetSlots[idx].tray_id = originalVal; // restore
+          if (slotType !== 'reject') {
+            targetSlots[idx].tray_id = originalVal; // restore only non-reject edits
+          }
           if (isDup) {
             if (errSpan) { errSpan.textContent = 'Already assigned to another slot'; errSpan.style.display = 'block'; errSpan.style.color = '#c62828'; }
             selectInvalidTrayInput(this);
@@ -3573,7 +3632,10 @@ document.addEventListener('DOMContentLoaded', function() {
           if (slotType === 'reject' && getOriginalIds()[newVal]) {
             targetSlots[idx].tray_id = null;
             var originalsInRejectEdit = _rejectSlots.filter(function(s) { return s.tray_id && getOriginalIds()[s.tray_id]; }).length;
-            targetSlots[idx].tray_id = originalVal;
+            // Keep the changed Reject slot invalid until the new value validates.
+            if (slotType !== 'reject') {
+              targetSlots[idx].tray_id = originalVal;
+            }
             if (originalsInRejectEdit >= _reuseCount) {
               if (errSpan) { errSpan.textContent = 'Reuse limit reached (' + _reuseCount + ')'; errSpan.style.display = 'block'; errSpan.style.color = '#c62828'; }
               selectInvalidTrayInput(this);
@@ -3585,7 +3647,7 @@ document.addEventListener('DOMContentLoaded', function() {
           targetSlots[idx].tray_id = newVal;
           if (slotType === 'reject') {
             _delinkSlots = [];
-            _acceptSlots.forEach(function(s) { if (!s.is_top) s.tray_id = null; });
+            _acceptSlots.forEach(function(s) { s.tray_id = null; });
           }
           if (slotType === 'accept' && targetSlots[idx].is_top) {
             autoFillAcceptNonTop();

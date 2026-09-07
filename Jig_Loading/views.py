@@ -325,7 +325,11 @@ class JigView(TemplateView):
 						base_qs = base_qs.none()
 						eligible_psns_for_filter = []
 					else:
-						eligible_psns, invalid_selected = resolve_add_model_eligible_psns(primary_psn, selected_model_psns)
+						selected_psns_for_validation = [
+							psn for psn in selected_model_psns
+							if psn and psn != primary_psn
+						]
+						eligible_psns, invalid_selected = resolve_add_model_eligible_psns(primary_psn, selected_psns_for_validation)
 						print(f'[JIG PICK] Add-model filter: eligible_psns={eligible_psns}, invalid_selected={invalid_selected}')
 
 						if invalid_selected or not eligible_psns:
@@ -424,16 +428,17 @@ class JigView(TemplateView):
 					'previous_module_remark': getattr(stock, 'BA_pick_remarks', '') or '',
 				}
 
-				# Use pre-fetched capacity map (no per-row DB query), then robust fallback
+				# Resolve by exact plating stock first; fall back to the pre-fetched FK map.
+				# This avoids stale legacy model_stock_no links overriding the exact model.
 				model_obj = getattr(batch, 'model_stock_no', None) if batch else None
-				if model_obj:
-					cap = master_capacity_map.get(getattr(model_obj, 'id', None))
-					if cap:
-						data['jig_capacity'] = cap
-				if not data['jig_capacity'] and batch:
+				if batch:
 					resolved_cap = resolve_jig_capacity_for_batch(batch)
 					if resolved_cap:
 						data['jig_capacity'] = resolved_cap
+				if not data['jig_capacity'] and model_obj:
+					cap = master_capacity_map.get(getattr(model_obj, 'id', None))
+					if cap:
+						data['jig_capacity'] = cap
 				master_data.append(data)
 
 			_t4 = _time.time()
@@ -592,16 +597,17 @@ class JigView(TemplateView):
 						'half_filled_tray_info_json': json.dumps(jc.half_filled_tray_info or []),
 						'type_of_input': get_type_of_input_for_batch(batch),
 					}
-					# Use pre-fetched capacity map (no per-row DB query), then robust fallback
+					# Resolve by exact plating stock first; fall back to the pre-fetched FK map.
+					# This avoids stale legacy model_stock_no links overriding the exact model.
 					model_obj = getattr(batch, 'model_stock_no', None) if batch else None
-					if model_obj:
-						cap = master_capacity_map.get(getattr(model_obj, 'id', None))
-						if cap:
-							excess_data['jig_capacity'] = cap
-					if not excess_data['jig_capacity'] and batch:
+					if batch:
 						resolved_cap = resolve_jig_capacity_for_batch(batch)
 						if resolved_cap:
 							excess_data['jig_capacity'] = resolved_cap
+					if not excess_data['jig_capacity'] and model_obj:
+						cap = master_capacity_map.get(getattr(model_obj, 'id', None))
+						if cap:
+							excess_data['jig_capacity'] = cap
 					master_data.append(excess_data)
 
 			except Exception:
@@ -779,18 +785,11 @@ class InitJigLoad(APIView):
 			if jig_capacity:
 				jig_capacity = int(jig_capacity)
 			else:
-				# try to fetch jig_capacity from JigLoadingMaster via batch->model mapping
+				# Resolve jig capacity through the shared exact-plating-first resolver.
 				try:
 					batch = ModelMasterCreation.objects.filter(batch_id=batch_id).first()
-					model_obj = getattr(batch, 'model_stock_no', None) if batch else None
-					if model_obj:
-						master = JigLoadingMaster.objects.filter(model_stock_no=model_obj).first()
-						if master and getattr(master, 'jig_capacity', None):
-							jig_capacity = int(master.jig_capacity)
-						else:
-							jig_capacity = int(lot_qty or 0)
-					else:
-						jig_capacity = int(lot_qty or 0)
+					resolved_cap = resolve_jig_capacity_for_batch(batch)
+					jig_capacity = int(resolved_cap) if resolved_cap else int(lot_qty or 0)
 				except Exception:
 					jig_capacity = int(lot_qty or 0)
 		except Exception:
@@ -2448,29 +2447,30 @@ def resolve_jig_capacity_for_batch(batch_obj):
 	Resolve jig capacity for a batch using JigLoadingMaster.
 
 	Fallback chain (in order):
-	  1. Direct model_stock_no ForeignKey match.
-	  2. Batch plating_stk_no -> ModelMaster -> JigLoadingMaster.
+	  1. Exact batch plating_stk_no -> JigLoadingMaster.
+	  2. Direct model_stock_no ForeignKey match.
 	  3. Batch model_no prefix -> JigLoadingMaster.
 
-	This makes capacity resolution robust against minor data-linkage
-	variations while keeping JigLoadingMaster as the single source of truth.
+	Exact plating stock is authoritative when present so a stale legacy
+	model_stock_no link cannot override the correct per-model jig master.
 	"""
 	if not batch_obj:
 		return None
 
-	# 1. Direct model_stock_no match
 	model_obj = getattr(batch_obj, 'model_stock_no', None)
-	if model_obj:
-		master = JigLoadingMaster.objects.filter(model_stock_no=model_obj).first()
-		if master and getattr(master, 'jig_capacity', None):
-			return int(master.jig_capacity)
 
-	# 2. Lookup via batch plating_stk_no
+	# 1. Exact lookup via batch plating_stk_no
 	plating_stk_no = getattr(batch_obj, 'plating_stk_no', '') or ''
 	if plating_stk_no:
 		master = JigLoadingMaster.objects.filter(
-			model_stock_no__plating_stk_no=plating_stk_no
+			model_stock_no__plating_stk_no__iexact=plating_stk_no
 		).first()
+		if master and getattr(master, 'jig_capacity', None):
+			return int(master.jig_capacity)
+
+	# 2. Direct model_stock_no match (legacy/fallback path)
+	if model_obj:
+		master = JigLoadingMaster.objects.filter(model_stock_no=model_obj).first()
 		if master and getattr(master, 'jig_capacity', None):
 			return int(master.jig_capacity)
 
@@ -5252,7 +5252,7 @@ class LotFetchAPI(APIView):
 
 			eligible_psns = []
 			if primary_psn:
-				eligible_psns, invalid_selected = resolve_add_model_eligible_psns(primary_psn, [primary_psn])
+				eligible_psns, invalid_selected = resolve_add_model_eligible_psns(primary_psn, [])
 				if invalid_selected:
 					eligible_psns = []
 			base_qs = TotalStockModel.objects.filter(

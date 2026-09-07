@@ -3614,6 +3614,7 @@ class SaveModelUnloadZ1View(APIView):
             tray_conflict = find_jig_unload_tray_conflict(
                 tray_id,
                 allowed_lot_ids=allowed_lot_ids_for_trays,
+                include_tray_master=True,
             )
             if tray_conflict:
                 return Response({
@@ -4623,6 +4624,7 @@ def validate_tray_occupancy_z1(request):
         tray_conflict = find_jig_unload_tray_conflict(
             tray_id,
             allowed_lot_ids=[lot_id] if lot_id else [],
+            include_tray_master=True,
         )
         if tray_conflict:
             return JsonResponse({

@@ -285,6 +285,22 @@ def get_brass_audit_submitted_detail(lot_id):
             "created_at": _fmt_dt(submission.created_at),
         })
 
+    # Completed-history classification must remain transaction-specific.
+    # Accepted trays can later be delinked/reused in live mirror tables, but that
+    # current lifecycle state must not reclassify the historical BA acceptance.
+    accepted_tray_ids = {
+        str(tray.get("tray_id") or "").strip().upper()
+        for lot in accept_lots
+        for tray in (lot.get("trays") or [])
+        if str(tray.get("tray_id") or "").strip()
+    }
+    if accepted_tray_ids and delinked_tray_ids:
+        delinked_tray_ids = [
+            tray_id
+            for tray_id in delinked_tray_ids
+            if tray_id not in accepted_tray_ids
+        ]
+
     reject_lots = []
     reject_children = list(
         BrassAudit_PartialRejectLot.objects
