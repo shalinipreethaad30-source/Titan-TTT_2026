@@ -1976,63 +1976,14 @@ def _na_do_submit_reject(request, lot_id, juat):
                 trays_snapshot=accept_trays,
                 created_by=request.user,
             )
-            # Create a real returned rejected continuation for Nickel Wiping.
-            # The partial-reject history row alone is not actionable by NWZ1;  NQ_PickTableView reads JigUnloadAfterTable.  Keep the accepted child above in Audit, and route only the rejected quantity back as a fresh Wiping row.
-            rejected_child_juat = JigUnloadAfterTable(
-                jig_qr_id=juat.jig_qr_id or '',
-                combine_lot_ids=juat.combine_lot_ids or [],
-                total_case_qty=rejected_qty,
-                version=juat.version,
-                plating_color=juat.plating_color,
-                plating_stk_no=juat.plating_stk_no,
-                polish_stk_no=juat.polish_stk_no,
-                polish_finish=juat.polish_finish,
-                plating_stk_no_list=juat.plating_stk_no_list or [],
-                polish_stk_no_list=juat.polish_stk_no_list or [],
-                version_list=juat.version_list or [],
-                category=juat.category or '',
-                tray_type=juat.tray_type or '',
-                tray_capacity=juat.tray_capacity or accept_cap,
-                nq_qc_accptance=False,
-                nq_qc_rejection=False,
-                nq_qc_few_cases_accptance=False,
-                nq_onhold_picking=False,
-                nq_draft=False,
-                nq_qc_accepted_qty=0,
-                nq_qc_accepted_qty_verified=False,
-                nq_missing_qty=0,
-                nq_physical_qty=0,
-                nq_accepted_tray_scan_status=False,
-                rejected_nickle_ip_stock=True,
-                na_ac_accepted_qty_verified=False,
-                na_last_process_date_time=tz.now(),
-                last_process_module='Nickel Audit',
-                current_stage='Nickel Wiping',
-            )
-            rejected_child_juat.save()
-
-            # The trays holding the rejected quantity now belong to the returned
-            # Wiping continuation.  Store them as active NQ trays (not as an NQ rejection result) so the returned lot can be opened/reworked in  Nickel Wiping while the original NA rejection history remains in Nickel_Audit_Rejected_TrayScan / NickelAudit_Submission.
-            for index, rt in enumerate(reject_trays):
-                tid = (rt.get('tray_id') or '').strip()
-                qty = int(rt.get('qty', 0))
-                if not tid or qty <= 0:
-                    continue
-                NickelQcTrayId.objects.update_or_create(
-                    lot_id=rejected_child_juat.lot_id,
-                    tray_id=tid,
-                    defaults={
-                        'tray_quantity': qty,
-                        'top_tray': bool(rt.get('is_top', False)) or index == 0,
-                        'tray_type': juat.tray_type or '',
-                        'tray_capacity': juat.tray_capacity or accept_cap,
-                        'rejected_tray': False,
-                        'delink_tray': False,
-                    },
-                )
-
+            # Partial Reject is terminal in Nickel Audit. Preserve a dedicated
+            # history identifier for NickelAudit_PartialRejectLot, but do NOT
+            # create an actionable JigUnloadAfterTable / NickelQcTrayId
+            # continuation in Nickel Wiping. Only Full Lot Reject is allowed
+            # to route the lot back to Nickel Wiping.
+            partial_reject_lot_id = _na_generate_lot_id()
             NickelAudit_PartialRejectLot.objects.create(
-                new_lot_id=rejected_child_juat.lot_id,
+                new_lot_id=partial_reject_lot_id,
                 parent_lot_id=lot_id,
                 parent_submission=submission,
                 rejected_qty=rejected_qty,
@@ -2042,8 +1993,8 @@ def _na_do_submit_reject(request, lot_id, juat):
                 created_by=request.user,
             )
             logger.info(
-                "[AUDIT_PARTIAL_REJECT_RETURN] parent=%s returned_lot=%s qty=%d trays=%s -> Nickel Wiping",
-                lot_id, rejected_child_juat.lot_id, rejected_qty, reject_trays,
+                "[AUDIT_PARTIAL_REJECT_COMPLETE] parent=%s history_lot=%s qty=%d trays=%s -> Nickel Audit Completed",
+                lot_id, partial_reject_lot_id, rejected_qty, reject_trays,
             )
     logger.info(
         "[AUDIT_REJECT_FLOW] action=SUBMIT_REJECT lot=%s rej_qty=%d partial=%s user=%s",

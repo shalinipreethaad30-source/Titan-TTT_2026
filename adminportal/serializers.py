@@ -25,10 +25,22 @@ class PolishFinishTypeSerializer(serializers.ModelSerializer):
         model = PolishFinishType
         fields = '__all__'
     
+    @staticmethod
+    def _validate_plain_text(value, label):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError(f"{label} cannot be empty.")
+        # Reject markup delimiters rather than stripping and saving altered data.
+        # Display code must continue to escape values, including older records.
+        if '<' in value or '>' in value:
+            raise serializers.ValidationError(f"HTML tags are not allowed in {label}.")
+        return value
+
     def validate_polish_finish(self, value):
-        if not value.strip():
-            raise serializers.ValidationError("Polish finish name cannot be empty.")
-        return value.strip()
+        return self._validate_plain_text(value, "Polish Finish")
+
+    def validate_polish_internal(self, value):
+        return self._validate_plain_text(value, "Internal Code")
 
     def validate(self, data):
         polish_finish = data.get('polish_finish', '').strip()

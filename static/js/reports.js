@@ -126,6 +126,8 @@ document.addEventListener("DOMContentLoaded", function () {
 
   function buildQuery(page) {
     const params = new URLSearchParams();
+    const moduleSelect = document.getElementById("module");
+    if (moduleSelect && moduleSelect.value) params.set("module", moduleSelect.value);
     if (fromInput.value) params.set("date_from", fromInput.value);
     if (toInput.value) params.set("date_to", toInput.value);
     if (stockInput.value.trim()) params.set("plating_stk_no", stockInput.value.trim());
@@ -198,14 +200,48 @@ document.addEventListener("DOMContentLoaded", function () {
     "Nickel Audit Z1", "Nickel Audit Z2",
     "Spider Spindle Z1", "Spider Spindle Z2",
   ];
-  var PREVIEW_COLUMN_COUNT = 4 + MODULE_COLUMNS.length + 1; // + S.No group + Remarks
+  var MODULE_FILTER_COLUMNS = {
+    "day-planning": "Day Planning",
+    "input-screening": "Input Screening",
+    "brass-qc": "Brass QC",
+    "iqf": "IQF",
+    "brass-audit": "Brass Audit",
+    "jig-loading": "Jig Loading",
+    "inprocess-inspection": "IP Inspection",
+    "jig-unloading-z1": "Jig Unloading Z1",
+    "jig-unloading-z2": "Jig Unloading Z2",
+    "nickel-inspection-z1": "Nickel Wiping Z1",
+    "nickel-inspection-z2": "Nickel Wiping Z2",
+    "nickel-audit-z1": "Nickel Audit Z1",
+    "nickel-audit-z2": "Nickel Audit Z2",
+    "spider-spindle-z1": "Spider Spindle Z1",
+    "spider-spindle-z2": "Spider Spindle Z2",
+  };
+
+  function visibleModuleColumns() {
+    const selected = document.getElementById("module");
+    const selectedColumn = selected && MODULE_FILTER_COLUMNS[selected.value];
+    return selectedColumn ? [selectedColumn] : MODULE_COLUMNS;
+  }
+
+  function syncPreviewHeaders(columns) {
+    document.querySelectorAll(".preview-table thead th").forEach(function (header) {
+      const name = header.textContent.trim();
+      if (MODULE_COLUMNS.indexOf(name) !== -1) {
+        header.style.display = columns.indexOf(name) !== -1 ? "" : "none";
+      }
+    });
+  }
 
   function renderPreview(data) {
+    const columns = visibleModuleColumns();
+    syncPreviewHeaders(columns);
+    const previewColumnCount = 4 + columns.length; // S.No, stock, lot qty, module data, remarks
     previewBody.innerHTML = "";
     if (!data.results.length) {
       const tr = document.createElement("tr");
       const td = document.createElement("td");
-      td.colSpan = PREVIEW_COLUMN_COUNT;
+      td.colSpan = previewColumnCount;
       td.style.textAlign = "center";
       td.textContent = "No records found for the selected filters.";
       tr.appendChild(td);
@@ -222,16 +258,26 @@ document.addEventListener("DOMContentLoaded", function () {
           tr.appendChild(td);
         });
         const moduleDetails = row.module_details || {};
-        MODULE_COLUMNS.forEach(function (name) {
+        columns.forEach(function (name) {
           const td = document.createElement("td");
           const state = moduleStates[name];
           if (state) td.classList.add("stage-" + state);
 
           const lines = moduleDetails[name];
           if (lines && lines.length) {
-            const grid = document.createElement("div");
-            grid.className = "cell-grid";
+            let grid = null;
+            let currentBlock = null;
+            const splitBlocks = lines.some(function (line) { return line.block !== undefined; });
+            if (splitBlocks) td.classList.add("stage-split");
             lines.forEach(function (line) {
+              const block = line.block === undefined ? 0 : line.block;
+              if (!grid || currentBlock !== block) {
+                grid = document.createElement("div");
+                grid.className = "cell-grid";
+                if (splitBlocks) grid.classList.add("report-stage-block", "block-" + line.block_state);
+                td.appendChild(grid);
+                currentBlock = block;
+              }
               const labelEl = document.createElement("span");
               labelEl.className = "cell-label";
               labelEl.textContent = line.label;
@@ -241,7 +287,6 @@ document.addEventListener("DOMContentLoaded", function () {
               grid.appendChild(labelEl);
               grid.appendChild(valueEl);
             });
-            td.appendChild(grid);
           } else {
             const value = modules[name];
             td.textContent = value === null || value === undefined ? "" : value;

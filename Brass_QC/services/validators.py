@@ -531,7 +531,7 @@ def validate_tray_cross_module_occupancy(tray_id, lot_id):
     Returns (module_name, error_str) if occupied, or (None, None) if free.
     """
     from ..models import BrassTrayId
-    from IQF.models import IQFTrayId
+    from IQF.models import IQFTrayId, IQF_Accepted_TrayID_Store
     from BrassAudit.models import (
         BrassAuditTrayId,
         Brass_Audit_Draft_Store,
@@ -572,6 +572,22 @@ def validate_tray_cross_module_occupancy(tray_id, lot_id):
     for qs, module_name in checks:
         if qs.exists():
             return module_name, f"Tray is currently occupied in {module_name}"
+
+    # IQF PARTIAL accepted trays are moved to an accepted child lot and can be
+    # removed from the live IQFTrayId occupancy path when the parent is consumed.
+    # IQF_Accepted_TrayID_Store preserves that accepted physical-tray ownership.
+    # Keep it blocking until the tray is explicitly delinked/released in TrayId.
+    tid = _norm_tray_id(tray_id)
+    if not is_tray_released_for_reuse(tid):
+        iqf_accepted_qs = IQF_Accepted_TrayID_Store.objects.filter(
+            tray_id__iexact=tid,
+            is_save=True,
+            is_draft=False,
+        )
+        if lot_id:
+            iqf_accepted_qs = iqf_accepted_qs.exclude(lot_id=lot_id)
+        if iqf_accepted_qs.exists():
+            return "IQF", "Tray is currently occupied in IQF"
 
     if has_active_input_screening_reject_occupancy(tray_id, lot_id):
         return "Input Screening", "Tray is rejected in Input Screening"

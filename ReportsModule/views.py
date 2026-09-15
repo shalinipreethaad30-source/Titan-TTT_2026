@@ -2706,12 +2706,14 @@ def _consolidated_rows_from_request(request):
     date_from = _parse_report_date(request.GET.get('date_from'))
     date_to = _parse_report_date(request.GET.get('date_to'))
     plating_stock_no = (request.GET.get('plating_stk_no') or '').strip()
+    module = (request.GET.get('module') or '').strip()
     if date_from and date_to and date_from > date_to:
         date_from, date_to = date_to, date_from
     return get_consolidated_report_rows(
         date_from=date_from,
         date_to=date_to,
         plating_stock_no=plating_stock_no,
+        module=module,
     )
 
 

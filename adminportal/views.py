@@ -69,6 +69,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from .models import Module, UserModuleProvision
 from Recovery_DP.models import *
+from Jig_Loading.models import JigLoadingMaster
 
 
 def _perf_username(username):
@@ -2878,6 +2879,48 @@ class PlatingColorAPIView(APIView):
 @method_decorator(csrf_exempt, name='dispatch')
 @method_decorator(login_required(login_url='login-api'), name='dispatch')
 @method_decorator(require_admin, name='dispatch')
+class JigCapacityAPIView(APIView):
+    """Read-only listing of Jig Loading Master records for the Model Master 'Jig Capacity' tab."""
+    renderer_classes = [JSONRenderer]
+
+    def get(self, request):
+        """Get all Jig Capacity master records (jig_type, jig_capacity, forging_info per model)"""
+        jig_masters = JigLoadingMaster.objects.select_related('model_stock_no').order_by(
+            'model_stock_no__model_no'
+        )
+        serializer = JigCapacitySerializer(jig_masters, many=True)
+        return Response({
+            'success': True,
+            'data': serializer.data
+        }, status=status.HTTP_200_OK)
+
+    def put(self, request, pk):
+        """Update an existing Jig Capacity master record"""
+        try:
+            jig_master = get_object_or_404(JigLoadingMaster, pk=pk)
+            serializer = JigCapacitySerializer(jig_master, data=request.data)
+            if serializer.is_valid():
+                updated_jig_master = serializer.save()
+                return Response({
+                    'success': True,
+                    'message': 'Jig capacity updated successfully!',
+                    'data': JigCapacitySerializer(updated_jig_master).data
+                }, status=status.HTTP_200_OK)
+            else:
+                return Response({
+                    'success': False,
+                    'message': 'Validation failed',
+                    'errors': serializer.errors
+                }, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({
+                'success': False,
+                'message': 'Unable to process the request. Please verify the submitted data and try again.'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@method_decorator(csrf_exempt, name='dispatch')
+@method_decorator(login_required(login_url='login-api'), name='dispatch')
+@method_decorator(require_admin, name='dispatch')
 class TrayTypeAPIView(APIView):
     renderer_classes = [JSONRenderer]
 
@@ -4522,7 +4565,19 @@ def validate_safe_username(value):
 
 
 def _validate_email(email):
-    if email and not _EMAIL_RE.match(email):
+    """Validate a supplied email before any account data is saved."""
+    from django.core.exceptions import ValidationError
+    from django.core.validators import validate_email
+
+    if not isinstance(email, str):
+        return 'Email must be a string.'
+    if not email.strip():
+        return 'Email is required.'
+    if len(email) > User._meta.get_field('email').max_length:
+        return 'Email exceeds the maximum allowed length.'
+    try:
+        validate_email(email)
+    except ValidationError:
         return 'Invalid email format.'
     return None
 
@@ -4537,6 +4592,25 @@ def _validate_password_complexity(password, username=''):
                 'one digit, and one special character.')
     if username and password.lower() == username.lower():
         return 'Password cannot be the same as the username.'
+    return None
+
+
+def _validate_account_password(password, user):
+    """Validate before hashing or saving; preserve the exact supplied password."""
+    from django.contrib.auth.password_validation import validate_password
+    from django.core.exceptions import ValidationError
+
+    if password is None or password == '':
+        return 'Password is required.'
+    if not isinstance(password, str):
+        return 'Password must be a string.'
+    error = _validate_password_complexity(password, username=user.username)
+    if error:
+        return error
+    try:
+        validate_password(password, user=user)
+    except ValidationError as exc:
+        return ' '.join(exc.messages)
     return None
 
 
@@ -4681,7 +4755,15 @@ class UserCreateAPIView(APIView):
         from .services import invalidate_user_modules_cache, sync_user_module_provisions_from_group
 
         data = request.data or {}
-        email = (data.get('email') or '').strip()
+        email = data.get('email')
+        if 'email' in data:
+            if isinstance(email, str):
+                email = email.strip()
+            email_error = _validate_email(email)
+            if email_error:
+                return Response({'success': False, 'error': email_error}, status=400)
+        else:
+            email = ''  # Existing-account updates may omit email.
         try:
             first_name = validate_person_name(data.get('first_name'))
             last_name = validate_person_name(data.get('last_name'))
@@ -4700,6 +4782,20 @@ class UserCreateAPIView(APIView):
             with transaction.atomic():
                 # If user exists, update instead of failing
                 existing = User.objects.filter(username=username).first()
+                if existing is None and not email:
+                    return Response({'success': False, 'error': 'Email is required.'}, status=400)
+
+                # New accounts require a password. Blank updates keep the old hash.
+                if existing is None or password not in (None, ''):
+                    candidate = User(
+                        username=username,
+                        first_name=first_name or (existing.first_name if existing else ''),
+                        last_name=last_name or (existing.last_name if existing else ''),
+                        email=email or (existing.email if existing else ''),
+                    )
+                    pwd_err = _validate_account_password(password, candidate)
+                    if pwd_err:
+                        return Response({'success': False, 'error': pwd_err}, status=400)
 
                 # One email = one user: reject if the email already belongs
                 # to a different account (case-insensitive).
@@ -4823,6 +4919,26 @@ def create_user(request):
     
     
     
+def _mask_email(value):
+    """
+    Partially redact an email address for list/table display (VAPT / Burp
+    finding "Email addresses disclosed" on /adminportal/api/users/list/).
+
+    'test@gmail.com' -> 't•••@gmail.com'
+
+    The bullet (U+2022) is not a valid email atom character, so the result
+    no longer matches an email pattern, while an admin can still recognise
+    which account a row belongs to. The single-user detail endpoint keeps the
+    real value because the edit form pre-fills from it.
+    """
+    value = (value or '').strip()
+    if '@' not in value:
+        return value
+    local, _, domain = value.partition('@')
+    masked_local = (local[0] if local else '') + '•••'
+    return masked_local + '@' + domain
+
+
 class UserListAPIView(APIView):
     permission_classes = [IsAuthenticated, IsAdminPermission]
     http_method_names = ['get', 'head', 'options']
@@ -4863,7 +4979,7 @@ class UserListAPIView(APIView):
                 "username": user.username,
                 "first_name": user.first_name,
                 "last_name": user.last_name,
-                "email": user.email,
+                "email": _mask_email(user.email),
                 "department": department,
                 "user_category": group_data['user_category'],
                 "user_categories": group_data['groups'],
@@ -5125,6 +5241,12 @@ class UserUpdateAPIView(APIView):
         new_first_name = data.get('first_name')
         new_last_name = data.get('last_name')
         new_email = data.get('email')
+        if 'email' in data:
+            if isinstance(new_email, str):
+                new_email = new_email.strip()
+            email_error = _validate_email(new_email)
+            if email_error:
+                return Response({'success': False, 'error': email_error}, status=400)
         password = data.get('password')
 
         try:
@@ -5154,10 +5276,8 @@ class UserUpdateAPIView(APIView):
                     )
                 user.email = new_email
 
-            if password and str(password).strip():
-                password = str(password).strip()
-                target_username = str(new_username or user.username).strip()
-                pwd_err = _validate_password_complexity(password, username=target_username)
+            if password not in (None, ''):
+                pwd_err = _validate_account_password(password, user)
                 if pwd_err:
                     return Response({'success': False, 'error': pwd_err}, status=400)
                 user.set_password(password)
