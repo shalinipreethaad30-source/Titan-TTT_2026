@@ -1742,6 +1742,49 @@ def iqf_submit_audit(request):
                         'iqf_incoming_qty': iqf_incoming_qty,
                     }, status=400)
 
+                # Restore the current same-lot IQF tray mirror only when FULL ACCEPT
+                # had to recover its accepted trays from the Brass QC fallback snapshot.
+                # Existing same-lot rows may already be present but delinked/zeroed; in
+                # that case reactivate ONLY the exact trays recovered for this FULL ACCEPT.
+                if not fa_trays_qs and accepted_trays:
+                    for tray in accepted_trays:
+                        _fa_tray_obj = IQFTrayId.objects.filter(
+                            lot_id=lot_id,
+                            tray_id=tray['tray_id'],
+                        ).order_by('-id').first()
+
+                        if _fa_tray_obj:
+                            _fa_tray_obj.tray_quantity = tray['qty']
+                            _fa_tray_obj.remaining_qty = tray['qty']
+                            _fa_tray_obj.top_tray = tray['top_tray']
+                            _fa_tray_obj.rejected_tray = False
+                            _fa_tray_obj.delink_tray = False
+                            _fa_tray_obj.IP_tray_verified = True
+                            _fa_tray_obj.new_tray = False
+                            _fa_tray_obj.save(update_fields=[
+                                'tray_quantity',
+                                'remaining_qty',
+                                'top_tray',
+                                'rejected_tray',
+                                'delink_tray',
+                                'IP_tray_verified',
+                                'new_tray',
+                            ])
+                        else:
+                            IQFTrayId.objects.create(
+                                lot_id=lot_id,
+                                tray_id=tray['tray_id'],
+                                tray_quantity=tray['qty'],
+                                batch_id=ts.batch_id,
+                                top_tray=tray['top_tray'],
+                                remaining_qty=tray['qty'],
+                                rejected_tray=False,
+                                delink_tray=False,
+                                IP_tray_verified=True,
+                                new_tray=False,
+                                user=request.user,
+                            )
+
                 full_accept_data = {
                     'label': 'FULL_ACCEPT',
                     'qty': accepted_qty,
@@ -3272,22 +3315,22 @@ def iqf_accepted_tray_slots(request):
             full_trays = accepted_qty // tray_capacity
             remainder = accepted_qty % tray_capacity
 
-            # Allocate full-capacity trays first, then the remainder.
-            for _ in range(full_trays):
-                slots.append({
-                    'slot_no': slot_no,
-                    'qty': tray_capacity,
-                    'is_top_tray': False,
-                    'tray_id': '',
-                    'status': 'new',
-                })
-                slot_no += 1
-
+            # Top tray (partial) goes first, then full-capacity trays.
             if remainder > 0:
                 slots.append({
                     'slot_no': slot_no,
                     'qty': remainder,
                     'is_top_tray': True,
+                    'tray_id': '',
+                    'status': 'new',
+                })
+                slot_no += 1
+
+            for _ in range(full_trays):
+                slots.append({
+                    'slot_no': slot_no,
+                    'qty': tray_capacity,
+                    'is_top_tray': False,
                     'tray_id': '',
                     'status': 'new',
                 })

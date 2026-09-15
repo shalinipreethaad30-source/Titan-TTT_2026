@@ -118,6 +118,7 @@ def release_tray_master_for_reuse(tray_id, *, delink_qty=None):
     tray_master.IP_tray_verified = False
     tray_master.rejected_tray = False
     tray_master.brass_rejected_tray = False
+    tray_master.new_tray = True
     tray_master.save(update_fields=[
         'lot_id',
         'batch_id',
@@ -129,8 +130,147 @@ def release_tray_master_for_reuse(tray_id, *, delink_qty=None):
         'IP_tray_verified',
         'rejected_tray',
         'brass_rejected_tray',
+        'new_tray',
     ])
     return True
+
+
+def is_nickel_wiping_tray_master_released(tray_id):
+    """
+    Return True when the master tray row has the explicit released/reusable
+    state created by Nickel Wiping delink.
+    """
+    tray_key = _tray_id(tray_id)
+    if not tray_key:
+        return False
+
+    from modelmasterapp.models import TrayId
+
+    tray_master = TrayId.objects.filter(tray_id__iexact=tray_key).first()
+    if not tray_master:
+        return False
+
+    return bool(
+        tray_master.delink_tray
+        and not tray_master.scanned
+        and not tray_master.lot_id
+        and not tray_master.batch_id_id
+        and not tray_master.rejected_tray
+        and not tray_master.brass_rejected_tray
+    )
+
+
+def _snapshot_rows(value):
+    return value if isinstance(value, list) else []
+
+
+def _normalize_reject_event_rows(rows):
+    reject_qty_by_id = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        tray_id = _tray_id(row.get('tray_id') or row.get('rejected_tray_id'))
+        if not tray_id:
+            continue
+        qty = _nq_int(
+            row.get(
+                'qty',
+                row.get('tray_quantity', row.get('rejected_tray_quantity', 0)),
+            )
+        )
+        if qty <= 0:
+            continue
+        reject_qty_by_id[tray_id] = qty
+    return [
+        {'tray_id': tray_id, 'qty': qty}
+        for tray_id, qty in reject_qty_by_id.items()
+    ]
+
+
+def get_current_nickel_wiping_reject_trays(lot_id):
+    """
+    Resolve the current/latest Nickel Wiping rejection-event trays for a lot.
+
+    Event precedence intentionally matches the delink flow: latest
+    NickelQC_Submission first, then the newest append-only reject record, then
+    legacy direct reject scans. Old historical events are not combined with a
+    newer event for the same lot.
+    """
+    lot_key = str(lot_id or '').strip()
+    if not lot_key:
+        return []
+
+    from Nickel_Inspection.models import (
+        Nickel_QC_Rejected_TrayScan,
+        NickelQC_Submission,
+        NickelWiping_FullRejectRecord,
+        NickelWiping_PartialRejectRecord,
+    )
+
+    submission = (
+        NickelQC_Submission.objects
+        .filter(lot_id=lot_key, submission_type__in=['PARTIAL', 'FULL_REJECT'])
+        .order_by('-created_at', '-id')
+        .first()
+    )
+    if submission is not None:
+        return _normalize_reject_event_rows(
+            _snapshot_rows(submission.reject_trays_data)
+        )
+
+    partial_record = (
+        NickelWiping_PartialRejectRecord.objects
+        .filter(source_lot_id=lot_key)
+        .order_by('-created_at', '-id')
+        .first()
+    )
+    full_record = (
+        NickelWiping_FullRejectRecord.objects
+        .filter(source_lot_id=lot_key)
+        .order_by('-created_at', '-id')
+        .first()
+    )
+    candidates = [r for r in (partial_record, full_record) if r is not None]
+    if candidates:
+        latest = max(candidates, key=lambda r: (r.created_at, r.id))
+        return _normalize_reject_event_rows(_snapshot_rows(latest.reject_trays))
+
+    legacy_rows = [
+        {
+            'tray_id': scan.rejected_tray_id,
+            'qty': _nq_int(scan.rejected_tray_quantity),
+        }
+        for scan in Nickel_QC_Rejected_TrayScan.objects.filter(lot_id=lot_key)
+    ]
+    return _normalize_reject_event_rows(legacy_rows)
+
+
+def has_unreleased_nickel_wiping_reject_trays(lot_id):
+    """
+    Return True when the current reject event has at least one tray that has
+    not been explicitly marked delinked in Nickel Wiping local event state.
+
+    Master TrayId release state is intentionally not used here: a master tray
+    can already look reusable for historical reasons, but a newly created
+    Nickel Wiping reject event must remain actionable until the operator runs
+    Delink Selected for this event.
+    """
+    from Nickel_Inspection.models import NickelQcTrayId
+
+    for row in get_current_nickel_wiping_reject_trays(lot_id):
+        tray_id = row.get('tray_id')
+        tray_obj = (
+            NickelQcTrayId.objects
+            .filter(lot_id=lot_id, tray_id__iexact=tray_id)
+            .first()
+        )
+        if tray_obj is None or not tray_obj.delink_tray:
+            return True
+    return False
+
+
+def has_releasable_nickel_wiping_reject_trays(lot_id):
+    return has_unreleased_nickel_wiping_reject_trays(lot_id)
 
 
 def _nickel_wiping_active_lot_ids(current_lot_id=None):
@@ -307,6 +447,13 @@ def validate_nickel_wiping_rejection_tray_available(
                     return False, 'Tray is occupied.'
         except ImportError:
             pass
+
+    # An explicitly delinked/released tray is reusable after the live
+    # cross-module ownership checks above have passed. Nickel Wiping's
+    # historical reject scans/submission snapshots are audit history and must
+    # not keep that released tray occupied.
+    if explicitly_released:
+        return True, ''
 
     active_lot_ids = _nickel_wiping_active_lot_ids(current_lot_id)
     if not active_lot_ids:

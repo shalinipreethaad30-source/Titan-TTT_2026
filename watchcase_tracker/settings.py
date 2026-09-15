@@ -12,7 +12,23 @@ https://docs.djangoproject.com/en/5.1/ref/settings/
 
 from pathlib import Path
 import os
+import sys
 from dotenv import load_dotenv
+
+# ---------------------------------------------------------------------------
+# Console encoding safety.
+# On Windows / IIS (wfastcgi) the stdout/stderr streams default to the legacy
+# cp1252 codec. Any diagnostic print() containing non-ASCII characters (e.g.
+# status emojis used across several views) then raises UnicodeEncodeError,
+# which surfaces to the client as an HTTP 500 with an HTML error page.
+# Force UTF-8 with a safe error handler so those writes can never crash a
+# request. Guarded because some hosting stdout objects lack reconfigure().
+# ---------------------------------------------------------------------------
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='backslashreplace')
+    except (AttributeError, ValueError):
+        pass
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -327,8 +343,32 @@ CSRF_COOKIE_SAMESITE = "Lax"
 # login. DJANGO_SESSION_COOKIE_SECURE lets ops correct this from the
 # deployed .env alone (no code/web.config change) if that turns out to be
 # the case; unset, behavior is unchanged from before.
-SESSION_COOKIE_SECURE = os.environ.get("DJANGO_COOKIE_SECURE", "true").strip().lower() != "false"
+SESSION_COOKIE_SECURE = os.environ.get(
+    'DJANGO_SESSION_COOKIE_SECURE',
+    'False' if DEBUG else 'True',
+).strip().lower() in ('1', 'true', 'yes', 'on')
 SESSION_COOKIE_AGE = 900       #15 -minute session timeout (was 86400 sec / 24 h)
+
+# ---------------------------------------------------------------------------
+# CSRF cookie hardening (VAPT / Burp finding: "Cookie without HttpOnly flag
+# set" — csrftoken).
+#
+# HttpOnly: the csrftoken cookie is never read by legitimate client code any
+# more — the token is taken from the {% csrf_token %} hidden field / the
+# <meta name="csrf-token"> tag by static/js/csrf_utils.js, which also injects
+# the X-CSRFToken header on every same-origin state-changing fetch()/XHR.
+# Django still validates writes by comparing that header (or the form field)
+# against the cookie the browser sends automatically, so HttpOnly is safe.
+#
+# Secure: mirror the session-cookie logic so the flag is only relaxed for a
+# genuine plain-HTTP deployment (controlled by the same env var); on the
+# HTTPS production host the cookie is Secure.
+# ---------------------------------------------------------------------------
+CSRF_COOKIE_HTTPONLY = True
+CSRF_COOKIE_SECURE = os.environ.get(
+    'DJANGO_SESSION_COOKIE_SECURE',
+    'False' if DEBUG else 'True',
+).strip().lower() in ('1', 'true', 'yes', 'on')
 
 # ---------------------------------------------------------------------------
 # HSTS — HTTP Strict-Transport-Security (VAPT Finding #7)
@@ -368,7 +408,7 @@ USE_I18N = True
 USE_TZ = True
 
 # Static files
-STATIC_URL = "/static/"
+STATIC_URL = '/static/'
 STATICFILES_DIRS = [os.path.join(BASE_DIR, 'static')]
 
 STATICFILES_FINDERS = [
@@ -459,7 +499,7 @@ LOGGING = {
 }
 
 # Microsoft (Entra ID) / MSAL settings
-MSAL_CLIENT_ID = os.getenv("MSAL_CLIENT_ID", "54a2fd19-0009-4e29-9d7b-b33e9ae8fbfa")
+MSAL_CLIENT_ID = os.getenv("MSAL_CLIENT_ID", "00855866-7b9b-498f-b1d5-d8aae7c9680e")
 MSAL_CLIENT_SECRET = os.getenv("MSAL_CLIENT_SECRET")
 # MSAL_TENANT_ID = os.getenv("MSAL_TENANT_ID", "common")
 # The Azure App Registration's Redirect URI is registered WITH a trailing
@@ -473,7 +513,7 @@ MSAL_REDIRECT_PATH = "/auth/microsoft/callback/"
 
 
 
-MSAL_TENANT_ID = os.getenv("MSAL_TENANT_ID","04132f71-f746-4a5b-a30e-66ea6d16714c",).strip()
+MSAL_TENANT_ID = os.getenv("MSAL_TENANT_ID","7cc91c38-648e-4ce2-a4e4-517ae39fc189",).strip()
 
 # Optional fixed origin (scheme+host[:port]) for the OAuth redirect URI, e.g.
 # "http://localhost:8000" or "https://titan.example.com". Pinning to one

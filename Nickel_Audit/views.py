@@ -1692,6 +1692,11 @@ def _na_do_submit_reject(request, lot_id, juat):
     submitted_delink_trays = data.get('delink_trays', [])
     remarks = (data.get('remarks', '') or '').strip()
     total_qty = juat.nq_qc_accepted_qty or juat.total_case_qty or 0
+    if full_lot_rejection and not remarks:
+        return Response(
+            {'success': False, 'error': 'Remarks mandatory for full lot rejection.'},
+            status=400,
+        )
     if not reason_ids:
         return Response({'success': False, 'error': 'reason_ids and rejected_qty required'}, status=400)
     if full_lot_rejection:
@@ -1715,6 +1720,11 @@ def _na_do_submit_reject(request, lot_id, juat):
     # allocation/scan validation below entirely. Partial rejection (accepted_qty > 0)
     # falls through unchanged to the existing tray-scan flow.
     if not is_partial:
+        if not remarks:
+            return Response(
+                {'success': False, 'error': 'Remarks mandatory for full lot rejection.'},
+                status=400,
+            )
         return _na_do_submit_full_reject(request, lot_id, juat, reason_ids, rejected_qty, total_qty, remarks)
 
     # AQL enforcement: a partial reject whose rejected qty exceeds the AQL

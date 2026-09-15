@@ -1201,6 +1201,12 @@
       <!-- DataTables JS -->
       <script nonce="{{ csp_nonce }}" src="{% static 'assets/js/jquery-3.6.0.min.js' %}"></script>
       <script nonce="{{ csp_nonce }}" src="{% static 'assets/js/jquery.dataTables.min.js' %}"></script>
+      <!-- CSRF token source (csrftoken cookie is HttpOnly): reads the token
+           from the tag below / the {% csrf_token %} hidden field and injects
+           the X-CSRFToken header on every same-origin write. Must load before
+           session_guard.js and all page scripts. -->
+      <meta name="csrf-token" content="{{ csrf_token }}">
+      <script src="{% static 'js/csrf_utils.js' %}" nonce="{{ csp_nonce }}"></script>
       <!-- Color Mapping -->
       <script src="{% static 'js/colormapping.js' %}" nonce="{{ csp_nonce }}"></script>
       <!-- Global HTML escaping helpers (XSS / HTML-injection prevention) -->

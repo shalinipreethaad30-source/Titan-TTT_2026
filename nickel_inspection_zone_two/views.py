@@ -57,8 +57,10 @@ from Inprocess_Inspection.models import InprocessInspectionTrayCapacity
 from django.contrib.auth.decorators import login_required
 from Nickel_Inspection.views import (
     nq_toggle_verified, nq_action, _resolve_nq_previous_unloading_remark,
-    _nq_completed_event_rows,
+    _nq_completed_event_rows, _latest_na_full_reject_timestamps,
+    _nq_pick_last_updated,
 )
+from Nickel_Inspection.services import has_unreleased_nickel_wiping_reject_trays
 from modelmasterapp.type_of_input import get_type_of_input_map
 
 def _nq_tray_capacity(tray_type_name):
@@ -212,6 +214,9 @@ class NQ_Zone_PickTableView(APIView):
         page_number = request.GET.get("page", 1)
         paginator = Paginator(queryset, 10)
         page_obj = paginator.get_page(page_number)
+        na_full_reject_timestamps = _latest_na_full_reject_timestamps(
+            [obj.lot_id for obj in page_obj.object_list]
+        )
         # ✅ UPDATED: Get values from JigUnloadAfterTable
         master_data = []
         for jig_unload_obj in page_obj.object_list:
@@ -271,7 +276,9 @@ class NQ_Zone_PickTableView(APIView):
                 "nq_onhold_picking": jig_unload_obj.nq_onhold_picking,
                 "nq_draft": jig_unload_obj.nq_draft,
                 "send_to_nickel_brass": jig_unload_obj.send_to_nickel_brass,
-                "last_process_date_time": jig_unload_obj.created_at,
+                "last_process_date_time": _nq_pick_last_updated(
+                    jig_unload_obj, na_full_reject_timestamps
+                ),
                 "iqf_last_process_date_time": None,
                 "nq_hold_lot": jig_unload_obj.nq_hold_lot,
                 "nq_holding_reason": jig_unload_obj.nq_holding_reason,  # Not applicable
@@ -582,11 +589,11 @@ class NQ_Zone_RejectTableView(APIView):
                     lot_rejected_comment = reason_store.lot_rejected_comment or ""
             data["lot_rejected_comment"] = lot_rejected_comment
             # --- End lot rejection remarks ---
-            # Check if any trays exist for this lot
-            tray_exists = NickelQcTrayId.objects.filter(
-                lot_id=stock_lot_id, delink_tray=False
-            ).exists()
-            data["tray_id_in_trayid"] = tray_exists
+            has_releasable_reject_trays = (
+                has_unreleased_nickel_wiping_reject_trays(stock_lot_id)
+            )
+            data["has_releasable_reject_trays"] = has_releasable_reject_trays
+            data["tray_id_in_trayid"] = has_releasable_reject_trays
             first_letters = []
             data["batch_rejection"] = False
             if stock_lot_id:

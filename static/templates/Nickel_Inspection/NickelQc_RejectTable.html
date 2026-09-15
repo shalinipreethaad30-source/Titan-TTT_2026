@@ -743,9 +743,9 @@ box-shadow: 2px 0 8px rgba(0,0,0,0.04);
                       <!-- Checkbox column -->
                       <td>
                         {% if data.tray_id_in_trayid %}
-                          <input type="checkbox" class="row-checkbox" />
+                          <input type="checkbox" class="row-checkbox" value="{{ data.stock_lot_id }}" />
                         {% else %}
-                          <input type="checkbox" class="row-checkbox" disabled title="No active trays, cannot delink" />
+                          <input type="checkbox" class="row-checkbox" value="{{ data.stock_lot_id }}" disabled title="Rejected tray(s) already delinked" />
                         {% endif %}
                       </td>
                       <!-- Column 1: S.No -->
@@ -842,6 +842,7 @@ box-shadow: 2px 0 8px rgba(0,0,0,0.04);
                         data-plating-stk-no="{{ data.plating_stk_no }}"
                         data-tray-qty-list="{{ data.tray_qty_list|default:'[]'|safe }}"
                         data-total-batch-quantity="{{ data.nq_lot_qty|default:0 }}"
+                        data-rejected-quantity="{{ data.nickel_rejection_total_qty|default:0 }}"
                         data-brass-missing-qty="{{ data.nq_missing_qty|default:0 }}">
                         <img src="{% static 'assets/icons/view.png' %}"
                             alt="View"
@@ -885,7 +886,7 @@ box-shadow: 2px 0 8px rgba(0,0,0,0.04);
                         {{ data.nickel_rejection_total_qty|default:0 }}
                     </td>
                     <!-- Column 10: Lot Status -->
-                    <td {% if data.nq_hold_lot %} class="row-inactive-blur" {% endif %}>
+                    <td class="lot-status-cell{% if data.nq_hold_lot %} row-inactive-blur{% endif %}">
                       {% if data.nq_onhold_picking or data.nq_draft %}
                         <div
                           class="d-inline-block px-3 fw-semibold text-center rounded-pill"
@@ -916,10 +917,17 @@ box-shadow: 2px 0 8px rgba(0,0,0,0.04);
                         </div>
 
                       {% elif data.nq_qc_rejection or data.nq_qc_few_cases_accptance or data.nq_qc_accptance %}
-                        <div class="d-inline-block px-3 fw-semibold text-center rounded-pill"
-                            style="border: 1px solid #0d5d17; background-color: #c5f9c2; color: #2f801b; font-size: 13px; white-space: nowrap; padding: 5px;">
-                          Yet to Release
-                        </div>
+                        {% if data.tray_id_in_trayid %}
+                          <div class="d-inline-block px-3 fw-semibold text-center rounded-pill"
+                              style="border: 1px solid #0d5d17; background-color: #c5f9c2; color: #2f801b; font-size: 13px; white-space: nowrap; padding: 5px;">
+                            Yet to Release
+                          </div>
+                        {% else %}
+                          <div class="d-inline-block px-3 fw-semibold text-center rounded-pill"
+                              style="border: 1px solid #6c757d; background-color: #e9ecef; color: #495057; font-size: 13px; white-space: nowrap; padding: 5px;">
+                            Released
+                          </div>
+                        {% endif %}
                       
                       {% else %}
                         <div class="d-inline-block px-3 fw-semibold text-center rounded-pill"
@@ -1750,6 +1758,7 @@ document.addEventListener("DOMContentLoaded", function () {
       const row = link.closest('tr');
       const brassPhysicalQty = row ? row.getAttribute('data-brass-physical-qty') : "0";
       const displayAcceptedQty = link.getAttribute('data-total-batch-quantity') || "0";
+      const rejectedQty = link.getAttribute('data-rejected-quantity') || "0";
       const brassMissingQty = row ? row.getAttribute('data-brass-missing-qty') : "0";
       const brassQcAcceptedQtyVerified = row ? row.getAttribute('data-brass-qc-accepted-qty-verified') === 'True' : false;
 
@@ -1784,27 +1793,18 @@ document.addEventListener("DOMContentLoaded", function () {
       // Set dynamic value for Lot Qty from the backend-provided row context.
       const modalLotQtyValue = document.getElementById('modalLotQty');
       if (modalLotQtyValue) {
-        modalLotQtyValue.textContent = displayAcceptedQty || '';
+        // Rejected Table view must show only the quantity rejected from this lot,
+        // not the original/full lot quantity.
+        modalLotQtyValue.textContent = rejectedQty || '0';
       }
 
-      // Ã¢Å“â€¦ ENHANCED: Dynamic quantity display based on verification status
+      // Rejected Table modal always shows the rejected quantity as Lot Qty.
+      // Do not replace it with the original lot quantity or physical quantity.
       if (modalLotQty && modalQtyLabel) {
-        if (isVerified) {
-          // Show Physical Qty when verified
-          modalQtyLabel.textContent = "Physical Qty:";
-          modalLotQty.textContent = brassPhysicalQty; // <-- This should be the correct value
-          modalLotQty.style.color = "#28a745";
-          console.log(`Ã¢Å“â€¦ Showing Physical Qty: ${brassPhysicalQty}`);
-        } else {
-          // Show Lot Qty when not verified
-          modalQtyLabel.textContent = "Lot Qty:";
-          modalLotQty.textContent = displayAcceptedQty;
-          modalLotQty.style.color = "#e67e22";
-          console.log(`Ã¢Å“â€¦ Showing Lot Qty: ${displayAcceptedQty}`);
-        }
+        modalQtyLabel.textContent = "Lot Qty:";
+        modalLotQty.textContent = rejectedQty || '0';
+        modalLotQty.style.color = "#e67e22";
       }
-
-
 
       // Single source of truth for the tray listing (mirrors NI_Completed.html —
       // this lot belongs to Nickel Inspection, not Nickel Audit Zone 2, so both
@@ -1913,7 +1913,7 @@ document.addEventListener("DOMContentLoaded", function () {
       modal.classList.add("open");
       
       console.log(`Ã°Å¸Å½Â¯ [MODAL OPENED] Successfully displayed ${dataSource} data`);
-      console.log(`   Quantity Display: ${isVerified ? 'Physical Qty' : 'Lot Qty'} = ${isVerified ? brassPhysicalQty : displayAcceptedQty}`);
+      console.log(`   Quantity Display: Lot Qty = ${rejectedQty}`);
     });
   });
 
@@ -2102,7 +2102,7 @@ document.addEventListener("DOMContentLoaded", function () {
     }
   });
 
-  // Initial update
+  // Initial update uses backend-rendered row eligibility.
   updateCheckboxes();
 
   // Delink button click with SweetAlert
@@ -2154,12 +2154,15 @@ document.addEventListener("DOMContentLoaded", function () {
         .then(res => res.json())
         .then(data => {
           if (data.success) {
+            const nothingNewReleased = Number(data.updated || 0) === 0;
             Swal.fire({
-              icon: 'success',
-              title: 'Delink Successful!',
-              text: `Delinked ${data.updated} REJECTED tray(s) from ${data.lots_processed} lot(s) successfully.`,
+              icon: nothingNewReleased ? 'info' : 'success',
+              title: nothingNewReleased ? 'Already Released' : 'Delink Successful!',
+              text: nothingNewReleased
+                ? 'The selected REJECTED tray(s) are already released. No duplicate delink was performed.'
+                : `Delinked ${data.updated} REJECTED tray(s) from ${data.lots_processed} lot(s) successfully.`,
               confirmButtonText: 'OK',
-              confirmButtonColor: '#28a745'
+              confirmButtonColor: nothingNewReleased ? '#6c757d' : '#28a745'
             }).then(() => {
               location.reload();
             });

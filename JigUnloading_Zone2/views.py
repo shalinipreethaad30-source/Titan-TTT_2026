@@ -118,6 +118,298 @@ def _zone2_source_metadata_from_tray_data(tray_data):
             return metadata
     return {}
 
+
+def _zone2_completed_normalize_model_tokens(raw_value):
+    if raw_value in (None, ''):
+        return []
+    if isinstance(raw_value, dict):
+        raw_value = (
+            raw_value.get('plating_stk_no')
+            or raw_value.get('model_name')
+            or raw_value.get('model')
+            or raw_value.get('model_no')
+        )
+    if isinstance(raw_value, (list, tuple, set)):
+        normalized = []
+        for item in raw_value:
+            normalized.extend(_zone2_completed_normalize_model_tokens(item))
+        return normalized
+
+    normalized = []
+    for item in re.split(r'[,|]', str(raw_value)):
+        model_no = re.sub(r'\[[^\]]*\]', '', item).strip()
+        if ':' in model_no:
+            model_no = model_no.split(':', 1)[0].strip()
+        model_no = model_no.strip(' -')
+        if not model_no or model_no.upper() in {'N/A', 'NONE', 'NULL'}:
+            continue
+        if re.fullmatch(r'(?:JLOT-)?(?:[A-Z]*LID|UNLOT)[A-Za-z0-9-]+', model_no):
+            continue
+        normalized.append(model_no)
+    return normalized
+
+
+def _zone2_completed_entry_source_lots(entry):
+    return _zone2_ordered_unique(
+        _zone2_extract_lot_id(lot_id)
+        for lot_id in (entry.get('combine_lot_ids') or [])
+    )
+
+
+def _zone2_completed_int(value, default=0):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def _zone2_completed_build_same_model_group_lookup(table_data):
+    source_lot_ids = set()
+    for entry in table_data:
+        source_lot_ids.update(_zone2_completed_entry_source_lots(entry))
+    source_lot_ids = {lot_id for lot_id in source_lot_ids if lot_id}
+    if not source_lot_ids:
+        return {}
+
+    source_jig_filter = Q(lot_id__in=source_lot_ids)
+    for source_lot_id in source_lot_ids:
+        source_jig_filter |= Q(**{'draft_data__lot_id_quantities__has_key': source_lot_id})
+
+    group_lookup = {}
+    candidate_jigs = JigCompleted.objects.filter(source_jig_filter).only(
+        'id', 'jig_id', 'multi_model_allocation', 'draft_data'
+    )
+
+    for source_jig in candidate_jigs:
+        allocation = getattr(source_jig, 'multi_model_allocation', None) or []
+        if isinstance(allocation, str):
+            try:
+                allocation = json.loads(allocation)
+            except Exception:
+                allocation = []
+        if not isinstance(allocation, list):
+            allocation = []
+
+        by_model = {}
+        for item in allocation:
+            if not isinstance(item, dict):
+                continue
+            source_lot = _zone2_extract_lot_id(
+                item.get('lot_id') or item.get('source_lot_id') or item.get('combined_lot_id')
+            )
+            models = _zone2_completed_normalize_model_tokens(item)
+            if not source_lot or not models:
+                continue
+            model_no = models[0]
+            by_model.setdefault(model_no, []).append({
+                'lot_id': source_lot,
+                'qty': _zone2_completed_int(
+                    item.get('qty')
+                    or item.get('quantity')
+                    or item.get('allocated_qty')
+                    or item.get('requested_qty')
+                    or item.get('loaded_qty')
+                    or item.get('stock_qty')
+                    or item.get('total_stock')
+                ),
+            })
+
+        for model_no, allocations in by_model.items():
+            group_lots = _zone2_ordered_unique(row['lot_id'] for row in allocations)
+            if len(group_lots) < 2 or not source_lot_ids.intersection(group_lots):
+                continue
+            group_key = (source_jig.id, str(getattr(source_jig, 'jig_id', '') or ''), model_no)
+            group_quantities = {
+                row['lot_id']: row['qty']
+                for row in allocations
+                if row['lot_id']
+            }
+            for lot_id in group_lots:
+                group_lookup[lot_id] = {
+                    'key': group_key,
+                    'model_no': model_no,
+                    'source_lots': group_lots,
+                    'source_quantities': group_quantities,
+                }
+
+    return group_lookup
+
+
+def _zone2_completed_best_submission(submissions):
+    if not submissions:
+        return None
+
+    def _score(submission):
+        score = _zone2_completed_int(getattr(submission, 'total_qty', 0))
+        if not getattr(submission, 'is_merged_additional', False):
+            score += 100000
+        if getattr(submission, 'tray_data', None):
+            score += 10000
+        return score
+
+    return sorted(submissions, key=_score, reverse=True)[0]
+
+
+def _zone2_consolidate_same_model_completed_rows(table_data):
+    """Collapse only true Zone 2 same-jig/same-model sibling rows for display."""
+    if len(table_data) < 2:
+        return table_data
+
+    group_lookup = _zone2_completed_build_same_model_group_lookup(table_data)
+    if not group_lookup:
+        return table_data
+
+    all_source_lots = set()
+    for entry in table_data:
+        all_source_lots.update(_zone2_completed_entry_source_lots(entry))
+
+    submissions_by_lot = {}
+    for submission in JUSubmittedZ1.objects.filter(
+        lot_id__in=list(all_source_lots),
+        is_draft=False,
+    ).order_by('-submitted_at', '-id'):
+        source_lot = _zone2_extract_lot_id(submission.lot_id)
+        submissions_by_lot.setdefault(source_lot, []).append(submission)
+
+    grouped_entries = {}
+    for entry in table_data:
+        source_lots = _zone2_completed_entry_source_lots(entry)
+        entry_models = set(_zone2_completed_normalize_model_tokens(entry.get('no_of_model_cases')))
+        if not entry_models:
+            entry_models.update(_zone2_completed_normalize_model_tokens(entry.get('plating_stk_no')))
+        entry_group = None
+
+        for source_lot in source_lots:
+            candidate = group_lookup.get(source_lot)
+            if not candidate:
+                continue
+            if entry_models and candidate['model_no'] not in entry_models:
+                continue
+            event_key = entry.get('Un_loaded_date_time') or entry.get('un_loaded_date_time')
+            entry_group = (candidate['key'], event_key)
+            break
+
+        if entry_group:
+            grouped_entries.setdefault(entry_group, []).append(entry)
+
+    if not grouped_entries:
+        return table_data
+
+    consolidated_by_original_index = {}
+    consumed_ids = set()
+    original_index_by_id = {entry.get('id'): idx for idx, entry in enumerate(table_data)}
+
+    for group_key, entries in grouped_entries.items():
+        if len(entries) < 2:
+            continue
+
+        allocation_info = None
+        for source_lot in _zone2_completed_entry_source_lots(entries[0]):
+            allocation_info = group_lookup.get(source_lot)
+            if allocation_info:
+                break
+        if not allocation_info:
+            continue
+
+        group_model_no = allocation_info['model_no']
+        group_source_lots = allocation_info['source_lots']
+
+        def _entry_score(entry):
+            score = _zone2_completed_int(entry.get('total_case_qty'))
+            tray_count = JigUnload_TrayId.objects.filter(lot_id=entry.get('lot_id')).count()
+            score += tray_count * 100
+            for source_lot in _zone2_completed_entry_source_lots(entry):
+                best_submission = _zone2_completed_best_submission(submissions_by_lot.get(source_lot, []))
+                if not best_submission:
+                    continue
+                if not getattr(best_submission, 'is_merged_additional', False):
+                    score += 100000
+                if getattr(best_submission, 'tray_data', None):
+                    score += 10000
+                if _zone2_completed_int(getattr(best_submission, 'total_qty', 0)) == _zone2_completed_int(entry.get('total_case_qty')):
+                    score += 1000
+                score += _zone2_completed_int(getattr(best_submission, 'total_qty', 0))
+            return score
+
+        canonical = dict(sorted(entries, key=_entry_score, reverse=True)[0])
+        canonical_source_lots = _zone2_completed_entry_source_lots(canonical)
+        canonical_submission = None
+        for source_lot in canonical_source_lots:
+            canonical_submission = _zone2_completed_best_submission(submissions_by_lot.get(source_lot, []))
+            if canonical_submission and not getattr(canonical_submission, 'is_merged_additional', False):
+                break
+
+        sibling_has_merged_marker = False
+        for entry in entries:
+            for source_lot in _zone2_completed_entry_source_lots(entry):
+                best_submission = _zone2_completed_best_submission(submissions_by_lot.get(source_lot, []))
+                if best_submission and getattr(best_submission, 'is_merged_additional', False):
+                    sibling_has_merged_marker = True
+                    break
+            if sibling_has_merged_marker:
+                break
+
+        canonical_total = _zone2_completed_int(canonical.get('total_case_qty'))
+        if (
+            canonical_submission
+            and not getattr(canonical_submission, 'is_merged_additional', False)
+            and (
+                sibling_has_merged_marker
+                or len(_zone2_completed_entry_source_lots(canonical)) > 1
+            )
+        ):
+            canonical_total = _zone2_completed_int(getattr(canonical_submission, 'total_qty', canonical_total))
+        elif not sibling_has_merged_marker:
+            canonical_total = sum(_zone2_completed_int(entry.get('total_case_qty')) for entry in entries)
+
+        combined_source_lots = _zone2_ordered_unique(
+            lot_id
+            for entry in entries
+            for lot_id in _zone2_completed_entry_source_lots(entry)
+        )
+        for source_lot in group_source_lots:
+            if source_lot not in combined_source_lots:
+                combined_source_lots.append(source_lot)
+
+        source_quantities = {}
+        for entry in entries:
+            source_quantities.update(entry.get('source_lot_id_quantities') or {})
+        for source_lot, qty in (allocation_info.get('source_quantities') or {}).items():
+            source_quantities.setdefault(source_lot, qty)
+
+        canonical['combine_lot_ids'] = combined_source_lots
+        canonical['source_lot_id_quantities'] = source_quantities
+        canonical['lot_id_quantities'] = {canonical.get('lot_id'): canonical_total}
+        canonical['total_case_qty'] = canonical_total
+        tray_capacity = _zone2_completed_int(canonical.get('jig_capacity') or canonical.get('tray_capacity'), 1) or 1
+        canonical['no_of_trays'] = math.ceil(canonical_total / tray_capacity) if canonical_total > 0 else 0
+        canonical['calculated_no_of_trays'] = canonical['no_of_trays']
+        canonical['no_of_model_cases'] = [group_model_no]
+        canonical['all_plating_stk_nos'] = [group_model_no]
+        canonical['unique_plating_stk_nos'] = [group_model_no]
+
+        canonical_index = min(original_index_by_id.get(entry.get('id'), 0) for entry in entries)
+        consolidated_by_original_index[canonical_index] = canonical
+        consumed_ids.update(entry.get('id') for entry in entries)
+
+        print(
+            "[ZONE2 COMPLETED TABLE] Consolidated same-model rows for "
+            f"{group_model_no}: kept {canonical.get('lot_id')} with sources {combined_source_lots}"
+        )
+
+    if not consolidated_by_original_index:
+        return table_data
+
+    result = []
+    for idx, entry in enumerate(table_data):
+        if idx in consolidated_by_original_index:
+            result.append(consolidated_by_original_index[idx])
+            continue
+        if entry.get('id') in consumed_ids:
+            continue
+        result.append(entry)
+    return result
+
 class JU_Zone_MainTable(LoginRequiredMixin, TemplateView):
     template_name = "Jig_Unloading - Zone_two/Jig_Unloading_Main_zone_two.html"
     login_url = 'login'
@@ -5263,6 +5555,9 @@ class JU_Zone_Completedtable(LoginRequiredMixin, TemplateView):
 
         print(f"\n[DEBUG] ===== FINAL SUMMARY =====")
         print(f"[DEBUG] Total table_data entries: {len(table_data)}")
+
+        table_data = _zone2_consolidate_same_model_completed_rows(table_data)
+        print(f"[DEBUG] Total Zone 2 table_data entries after same-model consolidation: {len(table_data)}")
         
         # Add pagination with consistent logic as Inprocess Inspection
         page_number = self.request.GET.get('page', 1)

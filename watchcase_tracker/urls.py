@@ -42,6 +42,7 @@ _social_django_available = find_spec('social_django') is not None
 from django.shortcuts import render
 from django.http import HttpResponse
 from django.shortcuts import redirect
+from django.views.generic.base import RedirectView
 
 
 def root_redirect(request):
@@ -57,6 +58,14 @@ urlpatterns = [
     
     #path('admin/', admin.site.urls),
     path('', root_redirect, name='root'),
+
+    # Browsers and scanners auto-request /favicon.ico. Without a route it fell
+    # through to FastCGI and returned an IIS 500 page with no HSTS / charset
+    # (VAPT / Burp). Redirect it to the real icon so it is a clean 301.
+    path(
+        'favicon.ico',
+        RedirectView.as_view(url=settings.STATIC_URL + 'assets/images/favicon.png', permanent=True),
+    ),
     
     path('accounts/profile/', lambda request: redirect('home')),
     

@@ -2349,7 +2349,7 @@ document.addEventListener('DOMContentLoaded', function() {
   }
 
   // --- Undo an Add Model action before it has been saved ---
-  function removeNewlyAddedModel(idx, mode) {
+  function removeNewlyAddedModel(idx, mode, targetMergedJigCompletedId) {
     var models = currentModelsData && currentModelsData.models;
     if (!models || !models[idx]) return;
     var m = models[idx];
@@ -2360,7 +2360,16 @@ document.addEventListener('DOMContentLoaded', function() {
       var removed = [];
       var removedQty = 0;
       (m.merged_lots || []).forEach(function(ml) {
-        if (ml.is_newly_added) { removed.push(ml); removedQty += (ml.qty || 0); } else { keep.push(ml); }
+        var isTarget = ml.is_newly_added && (
+          !targetMergedJigCompletedId ||
+          String(ml.jig_completed_id) === String(targetMergedJigCompletedId)
+        );
+        if (isTarget) {
+          removed.push(ml);
+          removedQty += (ml.qty || 0);
+        } else {
+          keep.push(ml);
+        }
       });
       // Best-effort: delete the merged-in lot's own record so it stops showing
       // as "Already Loaded" and is available again as an Add Model candidate.
@@ -2601,37 +2610,61 @@ document.addEventListener('DOMContentLoaded', function() {
   function renderTrayNewModelChips(m, idx) {
     const container = document.getElementById('z1TrayNewModelChips');
     if (!container) return;
-    let removeMode = '';
+
+    // A wholly-added different-model row is still represented by one chip.
     if (m.added_jig_completed_id && !m.is_unloaded) {
-      removeMode = 'row';
-    } else if ((m.merged_lots || []).some(function(ml) { return ml.is_newly_added; }) && !m.is_unloaded) {
-      removeMode = 'merge';
+      container.style.display = 'flex';
+      container.innerHTML =
+        '<span style="display:inline-flex;align-items:center;gap:6px;background:#fff8e1;border:1px solid #ffe082;color:#6a4a00;border-radius:14px;padding:3px 6px 3px 10px;font-size:11px;font-weight:500;">' +
+          escHtml(m.model_no) +
+          '<button type="button" class="z1-tray-chip-remove-btn" title="Remove newly added model" ' +
+          'style="background:none;border:none;color:#c62828;font-size:14px;font-weight:700;cursor:pointer;line-height:1;padding:0 2px;">&times;</button>' +
+        '</span>';
+      container.querySelector('.z1-tray-chip-remove-btn').addEventListener('click', function() {
+        showZ1Confirm('Remove this newly added model?', function() {
+          removeNewlyAddedModel(idx, 'row');
+          showLayer(layerModelList);
+        }, 'Remove', 'fa-trash');
+      });
+      return;
     }
-    if (!removeMode) {
+
+    // Same-model Add Model merges: show ONE pale-yellow chip for EACH newly
+    // added jig, instead of collapsing every merged lot into a single chip.
+    const addedMergedLots = (m.merged_lots || []).filter(function(ml) {
+      return ml.is_newly_added;
+    });
+
+    if (!addedMergedLots.length || m.is_unloaded) {
       container.style.display = 'none';
       container.innerHTML = '';
       return;
     }
+
     container.style.display = 'flex';
-    container.innerHTML =
-      '<span style="display:inline-flex;align-items:center;gap:6px;background:#fff8e1;border:1px solid #ffe082;color:#6a4a00;border-radius:14px;padding:3px 6px 3px 10px;font-size:11px;font-weight:500;">' +
-        escHtml(m.model_no) +
-        '<button type="button" id="z1TrayChipRemoveBtn" title="Remove newly added model" ' +
+    container.style.flexWrap = 'wrap';
+    container.style.gap = '6px';
+    container.innerHTML = addedMergedLots.map(function(ml) {
+      const jigLabel = ml.jig_id ? (' - ' + ml.jig_id) : '';
+      return '<span style="display:inline-flex;align-items:center;gap:6px;background:#fff8e1;border:1px solid #ffe082;color:#6a4a00;border-radius:14px;padding:3px 6px 3px 10px;font-size:11px;font-weight:500;">' +
+        escHtml(m.model_no + jigLabel) +
+        '<button type="button" class="z1-tray-chip-remove-btn" ' +
+        'data-jig-completed-id="' + escHtml(String(ml.jig_completed_id || '')) + '" ' +
+        'title="Remove this added jig" ' +
         'style="background:none;border:none;color:#c62828;font-size:14px;font-weight:700;cursor:pointer;line-height:1;padding:0 2px;">&times;</button>' +
       '</span>';
-    document.getElementById('z1TrayChipRemoveBtn').addEventListener('click', function() {
-      showZ1Confirm('Remove this newly added model?', function() {
-        removeNewlyAddedModel(idx, removeMode);
-        if (removeMode === 'row') {
-          // The whole model row being viewed was just removed — nothing left
-          // here to show, so go back to the model list.
-          showLayer(layerModelList);
-        } else {
-          // Merge undone: this model still exists, now reverted to its
-          // original qty/trays — stay on this screen and refresh it in place.
+    }).join('');
+
+    container.querySelectorAll('.z1-tray-chip-remove-btn').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        const targetJigCompletedId = this.dataset.jigCompletedId;
+        showZ1Confirm('Remove only this newly added jig?', function() {
+          removeNewlyAddedModel(idx, 'merge', targetJigCompletedId);
+          // The base model still exists. Refresh this tray screen so the chip,
+          // LOT Qty and tray-slot count immediately reflect the remaining jigs.
           openTrayScan(idx);
-        }
-      }, 'Remove', 'fa-trash');
+        }, 'Remove', 'fa-trash');
+      });
     });
   }
 
@@ -3424,8 +3457,27 @@ document.addEventListener('DOMContentLoaded', function() {
       showLayer(layerTrayScan);
       return;
     }
-    const additionalIds = Array.from(checked).map(function(cb) { return cb.dataset.jigId; });
-    const savedModelNo = currentModelsData.models[currentModelIndex].model_no;
+    // Keep Add Model cumulative: preserve previously merged jigs and add the new selection.
+    const currentModel = currentModelsData.models[currentModelIndex];
+    const additionalIdSet = new Set();
+
+    (currentModel.merged_lots || []).forEach(function(mergedLot) {
+      if (mergedLot.jig_completed_id) {
+        additionalIdSet.add(String(mergedLot.jig_completed_id));
+      }
+    });
+
+    Array.from(checked).forEach(function(cb) {
+      if (cb.dataset.jigId) {
+        additionalIdSet.add(String(cb.dataset.jigId));
+      }
+    });
+
+    // The base jig is already supplied separately as jig_completed_id.
+    additionalIdSet.delete(String(currentJigCompletedId));
+
+    const additionalIds = Array.from(additionalIdSet);
+    const savedModelNo = currentModel.model_no;
     const pendingTrayIds = collectPendingTrayIds();
     openUnloadModalWithAdditional(currentJigCompletedId, additionalIds, savedModelNo, pendingTrayIds);
   });
@@ -4161,4 +4213,3 @@ window.addEventListener('resize', function () {
 
 {% endblock %}
 {% endblock content %}
-

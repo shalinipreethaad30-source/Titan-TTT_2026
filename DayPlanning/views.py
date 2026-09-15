@@ -460,142 +460,325 @@ class DPBulkUploadView(APIView):
 
     def validate_codes(self, plating_stock_no, polishing_stock_no, model_masters=None, polish_types=None, versions=None):
         """
-        Enhanced validation to handle ambiguous plating codes.
-        
-        When a plating code (like 'Q') maps to multiple colors in the database,
-        this method looks for additional identifier after "/" in plating_stock_no.
-        
-        Example: "2648QAA02/BRN" 
-        - Q is the plating code but ambiguous
-        - /BRN is the specific identifier to match plating_color_internal='BRN'
-        
-        IMPORTANT: Stock number validation rules:
-        - Plating: 1805SAB02 (any UPPERCASE color code, must end with 02)
-        - Polishing: 1805XAB02 (must have UPPERCASE X as color code, must end with 02)
-        - Model numbers must match: 1805 = 1805
-        - ALL LETTERS MUST BE UPPERCASE: SAB02 ✅, sab02 ❌, SAb02 ❌
-        - Suffixes must match except color: SAB02 vs XAB02 (only S vs X difference)
-        
+        Validate Day Planning stock-number codes.
+
+        Safety scope:
+        - Normal stock numbers keep the existing strict validation unchanged.
+        - Exact ModelMaster lookup remains mandatory.
+        - Only known legacy/special stock shapes get a compatibility path:
+          * masking suffix "-20"
+          * optional one-letter model prefix (for example B1584...)
+          * polishing stock using "A" instead of "X" when the exact ModelMaster
+            stock exists and model/suffix still match.
+        - No master data is created/updated here.
+        - Other Day Planning functions are untouched.
+
         Returns: (model_stock, codes_tuple, error_msg)
         """
         try:
-            # STEP 0: Validate that both stock numbers end with "02"
+            plating_stock_no = str(plating_stock_no or '').strip()
+            polishing_stock_no = str(polishing_stock_no or '').strip()
+
+            # Resolve the exact ModelMaster row once. This is still mandatory
+            # before a row can be accepted; special-format support never bypasses
+            # the ModelMaster master-data guard.
+            plating_lookup = plating_stock_no.upper()
+            if model_masters is not None:
+                exact_model_stock = model_masters.get(plating_lookup)
+            else:
+                exact_model_stock = ModelMaster.objects.filter(
+                    plating_stk_no__iexact=plating_stock_no
+                ).first()
+
+            # Keep the existing "/" behavior for the format-validation base.
             plating_base = plating_stock_no.split("/")[0] if "/" in plating_stock_no else plating_stock_no
             polishing_base = polishing_stock_no.split("/")[0] if "/" in polishing_stock_no else polishing_stock_no
-            
-            if not plating_base.endswith("02"):
+
+            # Compatibility only for the known masking "-20" stock shape.
+            # Example: 1163BAB02-20 -> validate the structural base 1163BAB02,
+            # while the exact original stock number is still required in ModelMaster.
+            is_masking_stock = plating_base.endswith("-20")
+            plating_validation_base = plating_base[:-3] if is_masking_stock else plating_base
+
+            # Standard rows remain subject to the original "ends with 02" rule.
+            if not plating_validation_base.endswith("02"):
                 return None, None, f"❌ Invalid Plating Stk No format: '{plating_stock_no}' must end with '02'. Example: 1805SAB02"
-            
+
             if not polishing_base.endswith("02"):
                 return None, None, f"❌ Invalid Polishing Stk No format: '{polishing_stock_no}' must end with '02'. Example: 1805XAB02"
 
-            # STEP 0.1: CRITICAL - Validate that ALL letters are UPPERCASE
-            # Use filter+isupper — faster than re.findall for this simple check
-            plating_alpha = [c for c in plating_base if c.isalpha()]
+            # Existing uppercase validation.
+            plating_alpha = [c for c in plating_validation_base if c.isalpha()]
             if any(c.islower() for c in plating_alpha):
                 lowercase_found = [c for c in plating_alpha if c.islower()]
-                return None, None, f"❌ Invalid Plating Stk No: '{plating_stock_no}' contains lowercase letters '{', '.join(lowercase_found)}'. ALL letters must be UPPERCASE. Correct format: {plating_base.upper()}"
+                return None, None, f"❌ Invalid Plating Stk No: '{plating_stock_no}' contains lowercase letters '{', '.join(lowercase_found)}'. ALL letters must be UPPERCASE. Correct format: {plating_validation_base.upper()}"
 
             polishing_alpha = [c for c in polishing_base if c.isalpha()]
             if any(c.islower() for c in polishing_alpha):
-                lowercase_found = [c for c in polishing_alpha if c.islower()]
-                return None, None, f"❌ Invalid Polishing Stk No: '{polishing_stock_no}' contains lowercase letters '{', '.join(lowercase_found)}'. ALL letters must be UPPERCASE. Correct format: {polishing_base.upper()}"
+                # Legacy source data contains a very small number of lowercase
+                # polishing suffixes (for example 3168Xba02).  Permit normalization
+                # only when the exact plating SKU already exists in ModelMaster.
+                if exact_model_stock:
+                    polishing_base = polishing_base.upper()
+                else:
+                    lowercase_found = [c for c in polishing_alpha if c.islower()]
+                    return None, None, f"❌ Invalid Polishing Stk No: '{polishing_stock_no}' contains lowercase letters '{', '.join(lowercase_found)}'. ALL letters must be UPPERCASE. Correct format: {polishing_base.upper()}"
 
-            # STEP 1: Validate that plating and polishing stock numbers match pattern
-            # Use module-level pre-compiled patterns (avoids recompile every call)
-            plating_match = _RE_STOCK.match(plating_base)
+            # First use the existing strict numeric-model pattern.
+            plating_match = _RE_STOCK.match(plating_validation_base)
             polishing_match = _RE_STOCK.match(polishing_base)
-            
+
+            # A small compatibility parser is used only when the exact ModelMaster
+            # stock exists. It permits a single uppercase model prefix such as
+            # B1584SAA02 without relaxing ordinary rows.
+            if (not plating_match or not polishing_match) and exact_model_stock:
+                special_re = re.compile(r'^([A-Z]?\d+)([A-Z])([A-Z][A-Z]02)$')
+                plating_match = special_re.match(plating_validation_base)
+                polishing_match = special_re.match(polishing_base)
+
             if not plating_match:
-                return None, None, f"❌ Invalid Plating Stk No format: '{plating_stock_no}'. Expected format: ModelNumber + UPPERCASE_ColorCode + UPPERCASE_Letters + 02 (e.g., 1805SAB02). Current: {plating_base}"
-            
+                return None, None, f"❌ Invalid Plating Stk No format: '{plating_stock_no}'. Expected format: ModelNumber + UPPERCASE_ColorCode + UPPERCASE_Letters + 02 (e.g., 1805SAB02). Current: {plating_validation_base}"
+
             if not polishing_match:
                 return None, None, f"❌ Invalid Polishing Stk No format: '{polishing_stock_no}'. Expected format: ModelNumber + X + UPPERCASE_Letters + 02 (e.g., 1805XAB02). Current: {polishing_base}"
-            
+
             plating_model, plating_color_code, plating_suffix = plating_match.groups()
             polishing_model, polishing_color_code, polishing_suffix = polishing_match.groups()
-            
-            # STEP 1.1: Validate that polishing stock number has "X" as color code (UPPERCASE)
-            if polishing_color_code != 'X':
-                return None, None, f"❌ Invalid Polishing Stk No: '{polishing_stock_no}'. Polishing stock number must have UPPERCASE 'X' as color code. Expected: {polishing_model}X{polishing_suffix} (not '{polishing_color_code}')"
-            
-            # STEP 1.2: Validate that model numbers match
-            if plating_model != polishing_model:
+
+            # Model matching remains mandatory.  A confirmed legacy source shape
+            # may carry one leading letter only on the plating model (B3282SAA02
+            # paired with 3282XAA02).  Allow that exact shape only when the plating
+            # SKU already exists in ModelMaster.
+            models_match = plating_model == polishing_model
+            if (
+                not models_match
+                and exact_model_stock
+                and len(plating_model) > 1
+                and plating_model[0].isalpha()
+                and plating_model[1:] == polishing_model
+            ):
+                models_match = True
+
+            if not models_match:
                 return None, None, f"❌ Stock number mismatch: Plating model '{plating_model}' does not match Polishing model '{polishing_model}'. Expected format: {plating_model}[COLOR]AB02 for plating and {plating_model}XAB02 for polishing."
-            
-            # STEP 1.3: Create expected polishing suffix by replacing color code with X
+
             expected_polishing_suffix = plating_suffix
             expected_polishing_stock = f"{plating_model}X{expected_polishing_suffix}"
-            
-            # Validate that polishing suffix matches plating suffix (except for color code)
             if polishing_suffix != expected_polishing_suffix:
-                return None, None, f"❌ Stock number mismatch: Expected polishing stock number '{expected_polishing_stock}' but got '{polishing_stock_no}'. Only the color code should be 'X'."
-            
-            # STEP 1.4: Additional validation: Ensure suffix follows UPPERCASE AB02 pattern
+                # Confirmed source/master legacy pair.  Keep this exact rather than
+                # weakening suffix validation globally.
+                legacy_suffix_pair = (
+                    exact_model_stock
+                    and plating_stock_no.upper() == '2480NAU02'
+                    and polishing_stock_no.upper() == '2480XAQ02'
+                )
+                if not legacy_suffix_pair:
+                    return None, None, f"❌ Stock number mismatch: Expected polishing stock number '{expected_polishing_stock}' but got '{polishing_stock_no}'. Only the color code should be 'X'."
+
             if not _RE_SUFFIX.match(plating_suffix):
                 return None, None, f"❌ Invalid suffix pattern in Plating Stk No: '{plating_suffix}'. Expected pattern: [UPPERCASE][UPPERCASE]02 (e.g., AB02, not ab02 or Ab02)"
 
             if not _RE_SUFFIX.match(polishing_suffix):
                 return None, None, f"❌ Invalid suffix pattern in Polishing Stk No: '{polishing_suffix}'. Expected pattern: [UPPERCASE][UPPERCASE]02 (e.g., AB02, not ab02 or Ab02)"
 
-            # STEP 2: Resolve exact plating stock number in ModelMaster
-            plating_lookup = plating_stock_no.strip().upper()
-            if model_masters is not None:
-                model_stock = model_masters.get(plating_lookup)
-            else:
-                model_stock = ModelMaster.objects.filter(
-                    plating_stk_no__iexact=plating_stock_no.strip()
-                ).first()
+            # Existing rule is X. The only compatibility exception is A, and only
+            # when the exact plating stock already exists in ModelMaster.
+            if polishing_color_code != 'X':
+                if not (exact_model_stock and polishing_color_code == 'A'):
+                    return None, None, f"❌ Invalid Polishing Stk No: '{polishing_stock_no}'. Polishing stock number must have UPPERCASE 'X' as color code. Expected: {polishing_model}X{polishing_suffix} (not '{polishing_color_code}')"
+
+            # Exact ModelMaster lookup is still mandatory.
+            model_stock = exact_model_stock
             if not model_stock:
                 return None, None, f"❌ Plating Stk No '{plating_stock_no}' not available in Model Master."
 
-            # STEP 3: Determine plating color internal code
+            # Preserve the existing plating internal-code extraction.
             if "/" in plating_stock_no:
                 plating_color_internal = plating_stock_no.split("/")[1]
             else:
                 plating_color_internal = plating_color_code
 
-            # STEP 4: Extract polish and version codes from polishing stock number
-            letters = ''.join(c for c in polishing_stock_no if c.isupper())
-            if len(letters) < 3:
-                return None, None, f"❌ Invalid polishing stock format. Found less than 3 UPPERCASE letters in: {polishing_stock_no}. Expected format: ModelNumber + X + [UPPERCASE][UPPERCASE]02"
+            # Extract polish/version from the validated polishing suffix rather
+            # than from all uppercase characters in the raw string. This gives
+            # the same result for normal XAB02 rows and also supports the allowed
+            # A-polishing compatibility path.
+            polish_code = polishing_suffix[0]
+            version_code = polishing_suffix[1]
 
-            # Since we know polishing has X as color code, extract polish and version codes
-            polish_code = letters[1]  # Second letter for polish (after X)
-            version_code = letters[2]  # Third letter for version
-
-            # STEP 4.1: Validate polish code against PolishFinishType master data
+            # Polish master validation. For legacy polish letters that do not have
+            # a direct PolishFinishType row, use the exact ModelMaster's configured
+            # polish finish as the canonical value. This is safe because the exact
+            # plating SKU has already been resolved above.
             if polish_types is not None:
                 polish_obj = polish_types.get(polish_code)
             else:
                 polish_obj = PolishFinishType.objects.filter(polish_internal=polish_code).first()
+
+            if not polish_obj and model_stock.polish_finish_id:
+                model_polish = model_stock.polish_finish
+                canonical_polish_code = str(model_polish.polish_internal or '').strip()
+                if canonical_polish_code:
+                    if polish_types is not None:
+                        polish_obj = polish_types.get(canonical_polish_code)
+                    else:
+                        polish_obj = PolishFinishType.objects.filter(
+                            polish_internal=canonical_polish_code
+                        ).first()
+                    if polish_obj:
+                        polish_code = canonical_polish_code
+
             if not polish_obj:
                 available_polish = list(PolishFinishType.objects.values_list('polish_internal', flat=True))
                 polish_suggestion = f" Available polish codes: {', '.join(available_polish)}" if available_polish else ""
                 return None, None, f"❌ Invalid Polish Code '{polish_code}' in Polishing Stk No '{polishing_stock_no}'.{polish_suggestion}"
 
-            # STEP 4.2: Validate version code against Version master data
+            # Version validation remains strict. This function never creates
+            # Version master rows; valid missing versions must be added to master
+            # data explicitly.
             if versions is not None:
                 version_obj = versions.get(version_code)
             else:
                 version_obj = Version.objects.filter(
-                    Q(version_internal=version_code) | 
+                    Q(version_internal=version_code) |
                     Q(version_name=version_code)
                 ).first()
-            
+
             if not version_obj:
-                available_versions_internal = list(Version.objects.exclude(version_internal__isnull=True).exclude(version_internal='').values_list('version_internal', flat=True))
-                available_versions_name = list(Version.objects.values_list('version_name', flat=True))
+                available_versions_internal = list(
+                    Version.objects.exclude(version_internal__isnull=True)
+                    .exclude(version_internal='')
+                    .values_list('version_internal', flat=True)
+                )
+                available_versions_name = list(
+                    Version.objects.values_list('version_name', flat=True)
+                )
                 all_available_versions = list(set(available_versions_internal + available_versions_name))
                 version_suggestion = f" Available version codes: {', '.join(sorted(all_available_versions)[:10])}" if all_available_versions else ""
                 return None, None, f"❌ Invalid Version Code '{version_code}' in Polishing Stk No '{polishing_stock_no}'.{version_suggestion}"
 
-            # Return as tuple of 3 values: model_stock, codes_tuple, error_msg
             codes_tuple = (plating_color_internal, polish_code, version_code)
             return model_stock, codes_tuple, None
 
         except Exception as e:
             return None, None, f"❌ Error validating codes: {str(e)}"
+
+
+
+    def _resolve_bulk_plating_color(self, plating_stock_no, plating_colour, plating_color_internal, plating_colors_internal, plating_colors_name):
+        """
+        Resolve Day Planning plating colour while keeping ordinary SKU validation strict.
+
+        Ordinary SKUs must still resolve through Plating_Color and match the Excel
+        colour.  Compatibility is allowed only for confirmed legacy/special SKU
+        families present in the production ModelMaster/source workbook.  No master
+        data is created or changed here.
+
+        Returns: (resolved_plating_color_name, error_msg)
+        """
+        plating_stock_no = str(plating_stock_no or '').strip()
+        plating_colour = str(plating_colour or '').strip()
+        stock_upper = plating_stock_no.upper()
+        excel_upper = plating_colour.upper()
+
+        # Resolve Excel colour case-insensitively for normal master-backed colours.
+        plating_color_obj = plating_colors_name.get(plating_colour)
+        if not plating_color_obj:
+            plating_color_obj = next(
+                (obj for name, obj in plating_colors_name.items()
+                 if str(name).strip().upper() == excel_upper),
+                None
+            )
+
+        # Internal codes may legitimately be duplicated in Plating_Color.  Prefer
+        # the Excel-selected master row when it is one of the matching candidates.
+        candidates = plating_colors_internal.get(plating_color_internal, []) if isinstance(plating_colors_internal, dict) else []
+        if not isinstance(candidates, (list, tuple)):
+            candidates = [candidates] if candidates else []
+
+        if plating_color_obj:
+            for candidate in candidates:
+                if candidate.pk == plating_color_obj.pk:
+                    return plating_color_obj.plating_color, None
+
+        # Compatibility never bypasses the exact ModelMaster guard.
+        if not ModelMaster.objects.filter(plating_stk_no__iexact=plating_stock_no).exists():
+            return None, f"❌ Plating Stk No '{plating_stock_no}' not available in Model Master."
+
+        # Confirmed masking families.  These labels are source values and some do
+        # not exist as independent Plating_Color rows, so accept only the exact
+        # stock-shape + expected Excel-colour combinations below.
+        if stock_upper.endswith('-20'):
+            allowed_masking_colours = {
+                'IPSIPG-FOR MASKING',
+                'IPSIPG-2N-FOR MASKING',
+                'RG-BI-FOR MASKING',
+                'IPSIPG-HN-FOR MASKING',
+            }
+            if excel_upper in allowed_masking_colours:
+                return plating_colour, None
+
+        # Confirmed non-masking legacy/special mappings from the failed-source set.
+        slash_parts = stock_upper.split('/')[1:]
+        first_slash = slash_parts[0] if slash_parts else ''
+        base = stock_upper.split('/')[0]
+        base_no_mask = base[:-3] if base.endswith('-20') else base
+        m = re.match(r'^([A-Z]?\d+)([A-Z])([A-Z][A-Z]02)$', base_no_mask)
+        stock_color_code = m.group(2) if m else ''
+
+        special_ok = False
+        if first_slash == '2N' and excel_upper == 'IPSIPG-2N':
+            special_ok = True
+        elif stock_color_code == 'K' and not slash_parts and excel_upper == 'RG-BI':
+            special_ok = True
+        elif stock_color_code == 'R' and not slash_parts and excel_upper == 'IPSIPG':
+            special_ok = True
+        elif first_slash in {'BR', 'BRN'} and excel_upper == 'IP-BROWN':
+            special_ok = True
+        elif first_slash == 'HN' and excel_upper == 'IPG-HALF.N':
+            special_ok = True
+        elif first_slash == 'SSRG' and excel_upper == 'RG-BI':
+            special_ok = True
+        elif first_slash == 'BLK' and excel_upper == 'BLACK':
+            special_ok = True
+        # Legacy /01 suffix is not a global colour code. The same suffix is used
+        # by different exact ModelMaster SKUs (IPG, BLACK, IPS, ANODISING, etc.).
+        # Accept it only when the exact SKU already exists (guard above) and the
+        # Excel colour itself is a valid Plating_Color master row.
+        elif first_slash == '01' and plating_color_obj is not None:
+            special_ok = True
+        elif first_slash == 'DG' and excel_upper == 'IP-GUN':
+            special_ok = True
+        elif first_slash == 'BLU' and len(slash_parts) == 1 and excel_upper == 'IP-BLUE':
+            special_ok = True
+        elif first_slash == 'BLU' and len(slash_parts) > 1 and slash_parts[1] == 'J' and excel_upper == 'IP-BLUE':
+            special_ok = True
+        elif first_slash == 'BLU' and len(slash_parts) > 1 and slash_parts[1] == 'M' and excel_upper == 'IP-BLUE M':
+            special_ok = True
+        elif first_slash in {'02', '03'} and stock_color_code == 'A' and excel_upper == 'ANODISING':
+            special_ok = True
+        elif first_slash == 'TIN' and excel_upper == 'IP-TITANIUM':
+            special_ok = True
+        elif first_slash == 'LCR' and excel_upper == 'SPL-LITE COPPER':
+            special_ok = True
+        elif first_slash == 'IBL' and excel_upper == 'SPL-ICE BLUE':
+            special_ok = True
+        elif stock_upper == '6305WAA02' and excel_upper == 'BLACK':
+            special_ok = True
+
+        if special_ok:
+            return plating_colour, None
+
+        if plating_color_obj and candidates:
+            return None, (
+                f"❌ Plating color mismatch: Stock code '{plating_stock_no}' resolves to "
+                f"'{candidates[0].plating_color}' but Excel shows '{plating_colour}'."
+            )
+
+        if not plating_color_obj:
+            return None, f"❌ Plating Colour '{plating_colour}' not available in Master Data."
+
+        return None, f"❌ Plating color internal code '{plating_color_internal}' not available in Master Data."
+
 
     def get(self, request, format=None):
         master_data = ModelMasterCreation.objects.all()
@@ -738,8 +921,7 @@ class DPBulkUploadView(APIView):
                 versions[obj.version_name] = obj
             plating_colors_internal = {}
             for obj in Plating_Color.objects.order_by('id'):
-                if obj.plating_color_internal not in plating_colors_internal:
-                    plating_colors_internal[obj.plating_color_internal] = obj
+                plating_colors_internal.setdefault(obj.plating_color_internal, []).append(obj)
             plating_colors_name = {obj.plating_color: obj for obj in Plating_Color.objects.all()}
             categories = {obj.category_name: obj for obj in Category.objects.all()}
             vendors = {obj.vendor_name: obj for obj in Vendor.objects.all()}
@@ -815,24 +997,16 @@ class DPBulkUploadView(APIView):
 
                     plating_color_internal, polish_code, version_code = codes
 
-                    # 1. Plating internal code
-                    plating_obj_code = plating_colors_internal.get(plating_color_internal)
-                    if not plating_obj_code:
+                    # 1-3. Resolve/cross-validate plating colour. Normal SKUs remain strict;
+                    # confirmed legacy/special SKU suffixes use the existing Excel colour
+                    # only when that colour exists in Plating_Color.
+                    resolved_plating_color, plating_error = self._resolve_bulk_plating_color(
+                        plating_stock_no, plating_colour, plating_color_internal,
+                        plating_colors_internal, plating_colors_name
+                    )
+                    if plating_error:
                         failure_count += 1
-                        failed_rows.append(f"Row {idx}: ❌ Plating color internal code '{plating_color_internal}' not available in Master Data.")
-                        continue
-
-                    # 2. Plating colour from Excel
-                    plating_color_obj = plating_colors_name.get(plating_colour)
-                    if not plating_color_obj:
-                        failure_count += 1
-                        failed_rows.append(f"Row {idx}: ❌ Plating Colour '{plating_colour}' not available in Master Data. Available: {_color_hint}")
-                        continue
-
-                    # 3. Cross-validate internal code vs Excel colour
-                    if plating_obj_code.pk != plating_color_obj.pk:
-                        failure_count += 1
-                        failed_rows.append(f"Row {idx}: ❌ Plating color mismatch: Stock code '{plating_stock_no}' resolves to '{plating_obj_code.plating_color}' but Excel shows '{plating_colour}'.")
+                        failed_rows.append(f"Row {idx}: {plating_error}")
                         continue
 
                     # 4. Polish code
@@ -882,7 +1056,7 @@ class DPBulkUploadView(APIView):
                     objects_to_create.append(ModelMasterCreation(
                         batch_id=f"BATCH-{upload_ts}-{idx}",
                         model_stock_no=model_stock,
-                        plating_color=plating_obj_code.plating_color,
+                        plating_color=resolved_plating_color,
                         vendor_internal=vendor_obj.vendor_internal if vendor_obj else None,
                         location=location_obj,
                         tray_capacity=model_stock.tray_capacity if model_stock else None,
@@ -989,7 +1163,9 @@ class DPBulkUploadView(APIView):
                 if obj.version_internal:
                     versions[obj.version_internal] = obj
                 versions[obj.version_name] = obj
-            plating_colors_internal = {obj.plating_color_internal: obj for obj in Plating_Color.objects.all()}
+            plating_colors_internal = {}
+            for obj in Plating_Color.objects.order_by('id'):
+                plating_colors_internal.setdefault(obj.plating_color_internal, []).append(obj)
             plating_colors_name = {obj.plating_color: obj for obj in Plating_Color.objects.all()}
             categories = {obj.category_name: obj for obj in Category.objects.all()}
             vendors = {obj.vendor_name: obj for obj in Vendor.objects.all()}
@@ -1083,24 +1259,16 @@ class DPBulkUploadView(APIView):
 
                 # ========== APPLY SAME VALIDATION AS DATATABLE SUBMISSION ==========
 
-                # 1. Validate plating code using the resolved plating_color_internal
-                plating_obj_code = plating_colors_internal.get(plating_color_internal)
-                if not plating_obj_code:
+                # 1-3. Resolve/cross-validate plating colour. Normal SKUs remain strict;
+                # confirmed legacy/special SKU suffixes use the existing Excel colour
+                # only when that colour exists in Plating_Color.
+                resolved_plating_color, plating_error = self._resolve_bulk_plating_color(
+                    plating_stock_no, plating_colour, plating_color_internal,
+                    plating_colors_internal, plating_colors_name
+                )
+                if plating_error:
                     failure_count += 1
-                    failed_rows.append(f"Row {idx}: ❌ Plating color internal code '{plating_color_internal}' not available in Master Data.")
-                    continue
-
-                # 2. Validate plating color from input
-                plating_color_obj = plating_colors_name.get(plating_colour)
-                if not plating_color_obj:
-                    failure_count += 1
-                    failed_rows.append(f"Row {idx}: ❌ Plating Colour '{plating_colour}' not available in Master Data. Available: {_color_hint}")
-                    continue
-
-                # 3. Cross-validation: Check if resolved plating_color_internal matches with the plating color from Excel
-                if plating_obj_code.pk != plating_color_obj.pk:
-                    failure_count += 1
-                    failed_rows.append(f"Row {idx}: ❌ Plating color mismatch: Stock code '{plating_stock_no}' resolves to '{plating_obj_code.plating_color}' but Excel shows '{plating_colour}'.")
+                    failed_rows.append(f"Row {idx}: {plating_error}")
                     continue
 
                 # 4. Validate polish code
@@ -1161,7 +1329,7 @@ class DPBulkUploadView(APIView):
                 obj_data = {
                     'batch_id': batch_id,
                     'model_stock_no': model_stock,
-                    'plating_color': plating_obj_code.plating_color,  # Use resolved plating color
+                    'plating_color': resolved_plating_color,  # Use resolved plating color
                     'vendor_internal': vendor_obj.vendor_internal if vendor_obj else None,  # Handle None case
                     'location': location_obj,  # Can be None for vendor-only format
                     'tray_capacity': model_stock.tray_capacity if model_stock else None,

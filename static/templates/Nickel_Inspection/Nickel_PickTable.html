@@ -2749,8 +2749,22 @@ document.addEventListener("DOMContentLoaded", function () {
           } else {
             totalQtyDisp.textContent = '0';
             remainingDisp.textContent = state.totalQty;
+            if (errDiv.textContent === 'Remarks mandatory for full lot rejection.') {
+              errDiv.textContent = '';
+              var remarksInput = document.getElementById('nqRejectRemarksInput');
+              if (remarksInput) remarksInput.style.border = '';
+            }
           }
         };
+      }
+      var fullRejectRemarksInput = document.getElementById('nqRejectRemarksInput');
+      if (fullRejectRemarksInput) {
+        fullRejectRemarksInput.addEventListener('input', function () {
+          if (fullRejectRemarksInput.value.trim() && errDiv.textContent === 'Remarks mandatory for full lot rejection.') {
+            errDiv.textContent = '';
+            fullRejectRemarksInput.style.border = '';
+          }
+        });
       }
     }
 
@@ -2829,9 +2843,15 @@ document.addEventListener("DOMContentLoaded", function () {
       (state.origAllTrays || []).forEach(function (t) { origQtyById[t.tray_id] = t.qty; });
       return activeDelinkInputs().map(function (inp) {
         var tid = inp.value.trim().toUpperCase();
-        var qty = origQtyById.hasOwnProperty(tid) ? origQtyById[tid] : (parseInt(inp.dataset.qty, 10) || 0);
+
+        // A Delink row counts as filled only when the operator has entered a
+        // complete Original Tray ID. Partial text must not satisfy Delink
+        // completion or unlock Accept.
+        if (!tid || !origQtyById.hasOwnProperty(tid)) return null;
+
+        var qty = origQtyById[tid];
         return { tray_id: tid, qty: qty };
-      }).filter(function (row) { return row.tray_id && row.qty > 0; });
+      }).filter(function (row) { return !!row && row.tray_id && row.qty > 0; });
     }
 
     function setChipDelinkState(trayId, selected) {
@@ -2902,7 +2922,14 @@ document.addEventListener("DOMContentLoaded", function () {
     function fillDelinkSlotFromTap(trayId) {
       var delinkInputs = Array.from(delinkList.querySelectorAll('.nq-delink-tray-input'));
       if (!delinkInputs.length) return false;
-      var targetInput = delinkInputs.find(function (inp) { return !inp.value.trim(); }) || getFocusedTrayInput('.nq-delink-tray-input', delinkList) || delinkInputs[0];
+      // Prefer the currently focused Delink row first. If the operator has
+      // partially typed a tray ID there, tapping an Original Tray must
+      // complete/replace that same row instead of skipping to another empty
+      // Delink row.
+      var focusedDelinkInput = getFocusedTrayInput('.nq-delink-tray-input', delinkList);
+      var targetInput = focusedDelinkInput ||
+        delinkInputs.find(function (inp) { return !inp.value.trim(); }) ||
+        delinkInputs[0];
       if (isDuplicateTrayId(trayId, targetInput)) {
         errDiv.textContent = 'Tray ' + trayId + ' is already used in another slot.';
         return false;
@@ -2947,6 +2974,7 @@ document.addEventListener("DOMContentLoaded", function () {
       var nextInput = accInputs.slice(targetIndex + 1).find(function (inp) { return !inp.value.trim(); });
       if (nextInput) nextInput.focus();
       else targetInput.focus();
+      syncOriginalTrayChipStates();
       applyScanLockAndOrder();
       return true;
     }
@@ -2966,64 +2994,64 @@ document.addEventListener("DOMContentLoaded", function () {
         reuseInfo.style.display = 'none';
       }
 
-      // A Delink Tray ID that gets scanned and then removed (input cleared or
-      // swapped) invalidates any Accept top-tray already scanned against the
-      // now-stale Delink state — clear it so no stale accept data survives.
+      // Accept scanning is valid only after all required Delink trays are present.
+      // If Delink becomes incomplete, clear every Accept row so stale tray IDs do
+      // not survive.
       if (requiredDelinkCount > 0 && delinkRows.length < requiredDelinkCount) {
-        var topAccInput = acceptSlotsCont.querySelector('.nq-acc-tray-input');
-        if (topAccInput) topAccInput.value = '';
-      }
-
-      var delinkedIdSet = delinkRows.map(function (row) { return row.tray_id; });
-      // Auto-fill candidates must track the trays actually scanned into Delink,
-      // not blindly replay the backend's static ascending-order guess
-      // (state.acceptAutoTrays) — that guess assumed a specific original tray
-      // (e.g. NB-A00002) would be delinked. If the operator instead delinks a
-      // different original tray, NB-A00002 was effectively "skipped": it must
-      // fall back into the accept pool instead of vanishing, while whatever
-      // tray was actually scanned for delink must never appear as an accept
-      // candidate, however the backend originally planned it.
-      var reusedRejectIds = getRejectReuseTrayIds();
-      var expectedDelinkIds = (state.delinkSlots || []).map(function (slot) { return slot.tray_id; });
-      var skippedExpectedDelinkIds = expectedDelinkIds.filter(function (id) {
-        return delinkedIdSet.indexOf(id) === -1 && reusedRejectIds.indexOf(id) === -1;
-      });
-      var origById = {};
-      (state.origAllTrays || []).forEach(function (t) { origById[t.tray_id] = t; });
-      var filteredAutoTrays = (state.acceptAutoTrays || [])
-        .filter(function (t) { return delinkedIdSet.indexOf(t.tray_id) === -1; })
-        .concat(
-          skippedExpectedDelinkIds
-            .filter(function (id) { return origById.hasOwnProperty(id); })
-            .map(function (id) { return { tray_id: id, qty: origById[id].qty }; })
-        )
-        // Keep accept trays in deterministic tray-ID order even when a tray that
-        // was originally planned for Delink falls back into the Accept pool.
-        .sort(function (a, b) {
-          return String(a.tray_id || '').localeCompare(String(b.tray_id || ''));
+        acceptSlotsCont.querySelectorAll('.nq-acc-tray-input').forEach(function (inp) {
+          inp.value = '';
         });
-      var accInputs = Array.from(acceptSlotsCont.querySelectorAll('.nq-acc-tray-input'));
-      var slot0Val = accInputs.length > 0 ? accInputs[0].value.trim().toUpperCase() : '';
-      if (!slot0Val) {
-        // Top tray not scanned yet — leave slot 0 empty, clear remaining
-        for (var j = 1; j < accInputs.length; j++) accInputs[j].value = '';
       } else {
-        // Top tray scanned — preserve slot 0, re-fill slots 1+ excluding the slot-0 tray
-        var filteredForRest = filteredAutoTrays.filter(function (t) { return t.tray_id !== slot0Val; });
-        var availSlotsDS = accInputs.length - 1;
-        filteredForRest.slice(0, availSlotsDS).forEach(function (t, i) {
-          accInputs[i + 1].value = t.tray_id;
+        // Preserve the original "Scan only Top Tray" behavior, but only after the
+        // operator has entered a COMPLETE original tray ID. Partial manual typing
+        // such as J / JB / JB-A0015 must never trigger auto-fill.
+        var delinkedIdSet = delinkRows.map(function (row) { return row.tray_id; });
+        var reusedRejectIds = getRejectReuseTrayIds();
+        var expectedDelinkIds = (state.delinkSlots || []).map(function (slot) { return slot.tray_id; });
+        var skippedExpectedDelinkIds = expectedDelinkIds.filter(function (id) {
+          return delinkedIdSet.indexOf(id) === -1 && reusedRejectIds.indexOf(id) === -1;
         });
-        for (var j = Math.min(filteredForRest.length, availSlotsDS) + 1; j < accInputs.length; j++) {
-          accInputs[j].value = '';
+        var origById = {};
+        (state.origAllTrays || []).forEach(function (t) { origById[(t.tray_id || '').toUpperCase()] = t; });
+        var filteredAutoTrays = (state.acceptAutoTrays || [])
+          .filter(function (t) { return delinkedIdSet.indexOf(t.tray_id) === -1; })
+          .concat(
+            skippedExpectedDelinkIds
+              .filter(function (id) { return origById.hasOwnProperty((id || '').toUpperCase()); })
+              .map(function (id) { return { tray_id: id, qty: origById[(id || '').toUpperCase()].qty }; })
+          )
+          .sort(function (a, b) {
+            return String(a.tray_id || '').localeCompare(String(b.tray_id || ''));
+          });
+
+        var accInputs = Array.from(acceptSlotsCont.querySelectorAll('.nq-acc-tray-input'));
+        var slot0Val = accInputs.length > 0 ? accInputs[0].value.trim().toUpperCase() : '';
+        var slot0IsCompleteOriginal = !!slot0Val && origById.hasOwnProperty(slot0Val);
+
+        if (!slot0IsCompleteOriginal) {
+          // Empty or partially edited Top Tray: keep what the user is typing in
+          // row 1, clear all dependent auto-filled rows, and release their chips.
+          for (var j = 1; j < accInputs.length; j++) accInputs[j].value = '';
+        } else {
+          // Complete valid Top Tray: restore the original automatic fill of the
+          // remaining Accept rows, excluding the selected Top Tray itself.
+          var filteredForRest = filteredAutoTrays.filter(function (t) {
+            return (t.tray_id || '').toUpperCase() !== slot0Val;
+          });
+          var availSlotsDS = accInputs.length - 1;
+          filteredForRest.slice(0, availSlotsDS).forEach(function (t, i) {
+            accInputs[i + 1].value = t.tray_id;
+          });
+          for (var j = Math.min(filteredForRest.length, availSlotsDS) + 1; j < accInputs.length; j++) {
+            accInputs[j].value = '';
+          }
         }
       }
 
-      // Re-sync tappable original-tray chips from the values that are currently
-      // present in Reject / Delink / Accept rows. If a tray ID is cleared or
-      // replaced in any row, that tray immediately becomes tappable again.
+      // Re-sync tappable original-tray chips from the values currently present.
+      // Removing even one character from a previously complete tray ID immediately
+      // releases that original tray for tapping again.
       syncOriginalTrayChipStates();
-
       applyScanLockAndOrder();
     }
 
@@ -3056,8 +3084,19 @@ document.addEventListener("DOMContentLoaded", function () {
         return inputs.every(function (inp) { return inp.value.trim(); });
       }
 
+      function isDelinkSectionComplete(inputs) {
+        var originalIds = {};
+        (state.origAllTrays || []).forEach(function (t) {
+          originalIds[(t.tray_id || '').trim().toUpperCase()] = true;
+        });
+        return inputs.every(function (inp) {
+          var val = inp.value.trim().toUpperCase();
+          return !!val && originalIds.hasOwnProperty(val);
+        });
+      }
+
       var rejectComplete = isSectionComplete(rejInputs);
-      var delinkComplete = isSectionComplete(delinkInputs);
+      var delinkComplete = isDelinkSectionComplete(delinkInputs);
       var lockDelink = false;
       var lockAccept = !delinkComplete;
       state.lockDelink = lockDelink;
@@ -3167,7 +3206,7 @@ document.addEventListener("DOMContentLoaded", function () {
         rejectSlotsCont.appendChild(wrap);
       });
 
-      // Accept slots — empty by default; top tray scanned by user, rest auto-fill on input
+      // Accept slots — empty by default; complete Top Tray entry auto-fills the remaining rows
       var acceptAutoTrays = state.acceptAutoTrays;
       ;(data.accept_slots || []).forEach(function (slot, i) {
         var autoTray = '';
@@ -3199,40 +3238,57 @@ document.addEventListener("DOMContentLoaded", function () {
         inp.addEventListener('input', function () {
           inp.value = inp.value.trim().toUpperCase();
           var val = inp.value;
-          clearDuplicateTrayValue(val, inp);
+          if (clearDuplicateTrayValue(val, inp)) return;
           updateDelinkSection();
+
+          // Sequential cursor flow: after a complete valid Delink tray is
+          // manually typed/scanned, move to the next Delink row. When all
+          // Delink rows are complete, continue to the Top Accept tray.
+          var validOriginalIds = {};
+          (state.origAllTrays || []).forEach(function (t) {
+            validOriginalIds[(t.tray_id || '').trim().toUpperCase()] = true;
+          });
+
+          // Advance only when a complete valid Original Tray ID has been
+          // entered. A different valid original tray is allowed in a Delink
+          // slot; it does not have to equal the backend's initially expected ID.
+          if (val && validOriginalIds.hasOwnProperty(val)) {
+            var allDelinkInputs = Array.from(delinkList.querySelectorAll('.nq-delink-tray-input'));
+            var delinkIdx = allDelinkInputs.indexOf(inp);
+            var nextDelinkInput = allDelinkInputs.slice(delinkIdx + 1).find(function (nextInp) {
+              return !nextInp.value.trim() && !nextInp.disabled;
+            });
+            if (!nextDelinkInput) {
+              nextDelinkInput = allDelinkInputs.slice(delinkIdx + 1).find(function (nextInp) {
+                return !nextInp.value.trim();
+              });
+            }
+
+            if (nextDelinkInput) {
+              nextDelinkInput.focus();
+              lastFocusedTrayInput = nextDelinkInput;
+            } else {
+              var delinkDone = allDelinkInputs.every(function (d) {
+                var entered = d.value.trim().toUpperCase();
+                return !!entered && validOriginalIds.hasOwnProperty(entered);
+              });
+              if (delinkDone) {
+                applyScanLockAndOrder();
+                var firstAccInput = acceptSlotsCont.querySelector('.nq-acc-tray-input');
+                if (firstAccInput) {
+                  setTimeout(function () {
+                    firstAccInput.focus();
+                    lastFocusedTrayInput = firstAccInput;
+                  }, 0);
+                }
+              }
+            }
+          }
         });
       });
 
-      // Slot 0 input: user scans/types top accept tray, backend-plan fills the rest
-      var allAccSlotInputs = Array.from(acceptSlotsCont.querySelectorAll('.nq-acc-tray-input'));
-      if (allAccSlotInputs.length >= 1) {
-        allAccSlotInputs[0].addEventListener('input', function () {
-          var topVal = allAccSlotInputs[0].value.trim().toUpperCase();
-          allAccSlotInputs[0].value = topVal;
-          if (topVal && clearDuplicateTrayValue(topVal, allAccSlotInputs[0])) {
-            for (var k = 1; k < allAccSlotInputs.length; k++) { allAccSlotInputs[k].value = ''; }
-            updateDelinkSection();
-            return;
-          }
-          if (topVal) {
-            // Auto-fill remaining slots from acceptAutoTrays (excluding the typed tray)
-            // Clamp to available slots: slot 0 is taken by user, so only N-1 slots remain.
-            var otherTrays = (state.acceptAutoTrays || []).filter(function (t) { return t.tray_id !== topVal; });
-            var availSlots = allAccSlotInputs.length - 1;
-            otherTrays.slice(0, availSlots).forEach(function (t, idx) {
-              allAccSlotInputs[idx + 1].value = t.tray_id;
-            });
-            for (var k = Math.min(otherTrays.length, availSlots) + 1; k < allAccSlotInputs.length; k++) {
-              allAccSlotInputs[k].value = '';
-            }
-            updateDelinkSection();
-          } else {
-            for (var k = 1; k < allAccSlotInputs.length; k++) { allAccSlotInputs[k].value = ''; }
-            updateDelinkSection();
-          }
-        });
-      }
+      // Accept trays are entered one-by-one by the operator. Never auto-fill the
+      // remaining Accept rows while the user is typing or scanning a tray ID.
 
       updateDelinkSection();
 
@@ -3311,7 +3367,20 @@ document.addEventListener("DOMContentLoaded", function () {
             updateDelinkSection();
             var reuseRejInputs = Array.from(rejectSlotsCont.querySelectorAll('.nq-rej-tray-input'));
             var reuseIdx = reuseRejInputs.indexOf(inp);
-            if (reuseIdx >= 0 && reuseIdx < reuseRejInputs.length - 1) reuseRejInputs[reuseIdx + 1].focus();
+            if (reuseIdx >= 0 && reuseIdx < reuseRejInputs.length - 1) {
+              reuseRejInputs[reuseIdx + 1].focus();
+              lastFocusedTrayInput = reuseRejInputs[reuseIdx + 1];
+            } else if (reuseIdx === reuseRejInputs.length - 1) {
+              var firstDelinkInput = Array.from(delinkList.querySelectorAll('.nq-delink-tray-input')).find(function (input) {
+                return !input.value.trim();
+              });
+              var firstAccInput = acceptSlotsCont.querySelector('.nq-acc-tray-input');
+              var nextSectionInput = firstDelinkInput || firstAccInput;
+              if (nextSectionInput) {
+                nextSectionInput.focus();
+                lastFocusedTrayInput = nextSectionInput;
+              }
+            }
             return;
           }
           post(API_BASE + 'action/', { action: 'CHECK_TRAY', tray_id: val, lot_id: state.lotId })
@@ -3363,10 +3432,55 @@ document.addEventListener("DOMContentLoaded", function () {
       });
       acceptSlotsCont.querySelectorAll('.nq-acc-tray-input').forEach(function (inp) {
         inp.addEventListener('input', function () {
-          // Keep tapping availability in sync even when an Accept tray ID is
-          // manually removed/replaced. Do not auto-refill the cleared row here.
-          syncOriginalTrayChipStates();
-          applyScanLockAndOrder();
+          var accInputs = Array.from(acceptSlotsCont.querySelectorAll('.nq-acc-tray-input'));
+          var idx = accInputs.indexOf(inp);
+          var val = inp.value.trim().toUpperCase();
+          inp.value = val;
+
+          // Exact duplicates are not allowed. Partial manual typing is left alone.
+          if (val && clearDuplicateTrayValue(val, inp)) {
+            val = '';
+          }
+
+          // Any edit of a previously complete row immediately releases the old
+          // tray chip. If the row is cleared, every dependent row below is cleared.
+          if (!val && idx >= 0) {
+            for (var i = idx + 1; i < accInputs.length; i++) {
+              accInputs[i].value = '';
+            }
+          }
+
+          // Row 1 is the Top Tray. Recalculate Accept auto-fill only here.
+          // updateDelinkSection() now auto-fills rows 2+ ONLY when row 1 exactly
+          // matches a complete original tray ID; partial typing never auto-fills.
+          if (idx === 0) {
+            updateDelinkSection();
+          } else {
+            syncOriginalTrayChipStates();
+            applyScanLockAndOrder();
+          }
+
+          // Once the entered Accept Tray ID is a complete valid original tray,
+          // move the cursor to the next empty Accept row. This applies to manual
+          // typing/scanning as well as the normal sequential entry flow.
+          var acceptedOriginalIds = {};
+          (state.origAllTrays || []).forEach(function (t) {
+            acceptedOriginalIds[(t.tray_id || '').trim().toUpperCase()] = true;
+          });
+          if (val && acceptedOriginalIds[val]) {
+            var nextEmptyAccept = accInputs.slice(idx + 1).find(function (nextInp) {
+              return !nextInp.value.trim() && !nextInp.disabled;
+            });
+            if (!nextEmptyAccept) {
+              nextEmptyAccept = accInputs.slice(idx + 1).find(function (nextInp) {
+                return !nextInp.value.trim();
+              });
+            }
+            if (nextEmptyAccept) {
+              nextEmptyAccept.focus();
+              lastFocusedTrayInput = nextEmptyAccept;
+            }
+          }
         });
       });
       syncOriginalTrayChipStates();
@@ -3431,6 +3545,7 @@ document.addEventListener("DOMContentLoaded", function () {
         reject_trays: rejTrays,
         accept_trays: accTrays,
         delink_trays: state.reuseTrays,
+        full_lot_rejection: !!(fullRejCb && fullRejCb.checked),
         remarks: document.getElementById('nqRejectRemarksInput').value.trim(),
         lot_id: state.lotId,
       };
@@ -3441,6 +3556,16 @@ document.addEventListener("DOMContentLoaded", function () {
         errDiv.textContent = '';
         var payload = buildPayload();
         payload.action = 'SUBMIT_REJECT';
+        var remarksInput = document.getElementById('nqRejectRemarksInput');
+        if (fullRejCb && fullRejCb.checked && !payload.remarks) {
+          errDiv.textContent = 'Remarks mandatory for full lot rejection.';
+          if (remarksInput) {
+            remarksInput.style.border = '2px solid #c62828';
+            remarksInput.focus();
+          }
+          return;
+        }
+        if (remarksInput) remarksInput.style.border = '';
         // Full Lot Rejection intentionally skips per-reason quantity entry (see fullRejCb
         // handler above) — only a partial rejection needs a reason to justify the split.
         if (!(fullRejCb && fullRejCb.checked) && !payload.reason_ids.length) {
