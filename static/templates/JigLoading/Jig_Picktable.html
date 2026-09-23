@@ -3429,8 +3429,9 @@ document.addEventListener('DOMContentLoaded', function () {
     // Attach scan handlers to both panels
     _attachSplitScanHandlers();
 
-    // ===== RESTORE FOCUS after re-render (find next unvalidated input in sequence) =====
-    setTimeout(function() {
+    // Restore focus in the same task that replaces the inputs so the next
+    // scanner keystroke cannot land on the page during a timer delay.
+    (function restoreSplitScanFocus() {
       // GUARD: Skip auto-focus if draft is being restored — draft restore handles its own focus
       if (window._isDraftRestoring) {
         console.log('[FOCUS_RESTORE] Skipped — draft restore in progress');
@@ -3493,7 +3494,7 @@ document.addEventListener('DOMContentLoaded', function () {
           console.warn('[FOCUS_RESTORE] Failed to restore focus:', e);
         }
       }
-    }, 150);  // Wait for DOM to fully stabilize after re-render
+    })();
 
     console.log('[SPLIT_PANEL] Rendered — delink:', delinkTrays.length, 'excess:', excessTrays.length, 'topTray:', !!topTray);
   }
@@ -11217,6 +11218,7 @@ if (!formatResult.valid) {
 
     scanInput.addEventListener('keydown', function(e) {
       if (e.key !== 'Enter') return;
+      e.preventDefault();
       var scanId = _jigNormalizeScanValue(scanInput.value);
       scanInput.value = scanId;
       if (scanId.length < 8) {
@@ -11326,87 +11328,44 @@ if (!formatResult.valid) {
     return true;
   }
 
-  function _jigScanSearchAcrossPages(lotId, currentPage, scanData) {
-    // Store lot_id in sessionStorage, then navigate page-by-page
-    sessionStorage.setItem('jigScanPendingLotId', lotId);
-    sessionStorage.setItem('jigScanOriginPage', currentPage);
-    sessionStorage.setItem('jigScanPendingOpenAddJig', scanData && scanData.open_add_jig ? '1' : '0');
-    sessionStorage.setItem('jigScanPendingJigId', scanData && scanData.jig_id ? scanData.jig_id : '');
-
-    var totalPages = document.querySelectorAll('.pagination .page-link[href]').length;
-    // Try next page first, wrap around
-    var nextPage = parseInt(currentPage) + 1;
-    var url = new URL(window.location);
-
-    // Check all pages starting from 1
-    for (var p = 1; p <= 100; p++) {
-      if (String(p) === String(currentPage)) continue;
-      url.searchParams.set('page', p);
-      window.location.href = url.toString();
-      return;
-    }
-
-    // If we get here, not found
+  async function _jigScanSearchAcrossPages(lotId, currentPage, scanData) {
     var scanStatus = document.getElementById('pickTableScanStatus');
-    if (scanStatus) {
-      scanStatus.style.color = '#dc3545';
-      scanStatus.textContent = 'Lot not found!';
+    var scanInput = document.getElementById('pickTableScanInput');
+    try {
+      var scanner = window.GlobalPickTableScanner;
+      if (!scanner) throw new Error('Scanner not ready');
+      // Reuse the F2 scanner's background page lookup and table replacement.
+      // An exact lot match avoids choosing another lot from the same batch.
+      var match = await scanner.findTrayInCurrentPickTable(
+        scanInput ? scanInput.value : '',
+        Object.assign({}, scanData || {}, {
+          url: '/jig_loading/JigView/', lot_id: lotId, batch_id: ''
+        })
+      );
+      if (match && match.row) {
+        _jigScanHighlightAndMoveToTop(match.row, lotId);
+        _jigOpenAddModalForDraftScan(match.row, scanData);
+        if (scanInput) scanInput.value = '';
+      }
+      if (scanStatus) {
+        scanStatus.style.color = match && match.row ? '#28a745' : '#dc3545';
+        scanStatus.textContent = match && match.row ? 'PLEASE SCAN' : 'Lot not found!';
+      }
+    } catch (error) {
+      if (scanStatus) {
+        scanStatus.style.color = '#dc3545';
+        scanStatus.textContent = 'Scan lookup failed. Please try again.';
+      }
     }
+    if (scanInput) { scanInput.focus(); scanInput.select(); }
+  }
+
+  // Clear old page-navigation search state so it cannot start a reload loop.
+  document.addEventListener('DOMContentLoaded', function() {
     sessionStorage.removeItem('jigScanPendingLotId');
     sessionStorage.removeItem('jigScanOriginPage');
     sessionStorage.removeItem('jigScanPendingOpenAddJig');
     sessionStorage.removeItem('jigScanPendingJigId');
-  }
-
-  // On page load: check if we're searching for a lot across pages
-  document.addEventListener('DOMContentLoaded', function() {
-    var pendingLotId = sessionStorage.getItem('jigScanPendingLotId');
-    if (!pendingLotId) return;
-    var pendingOpenAddJig = sessionStorage.getItem('jigScanPendingOpenAddJig') === '1';
-    var pendingJigId = sessionStorage.getItem('jigScanPendingJigId') || '';
-
-    var row = document.querySelector('tr[data-stock-lot-id="' + pendingLotId + '"]');
-    if (row) {
-      sessionStorage.removeItem('jigScanPendingLotId');
-      sessionStorage.removeItem('jigScanOriginPage');
-      sessionStorage.removeItem('jigScanPendingOpenAddJig');
-      sessionStorage.removeItem('jigScanPendingJigId');
-      _jigScanHighlightAndMoveToTop(row, pendingLotId);
-      _jigOpenAddModalForDraftScan(row, {
-        is_draft: pendingOpenAddJig || _jigRowLooksDraft(row),
-        open_add_jig: pendingOpenAddJig,
-        jig_id: pendingJigId
-      });
-      var scanStatus = document.getElementById('pickTableScanStatus');
-      if (scanStatus) {
-        scanStatus.style.color = '#28a745';
-        scanStatus.textContent = 'PLEASE SCAN';
-        scanStatus.style.display = 'inline-block';
-      }
-    } else {
-      // Not found on this page either — try next page
-      var currentUrl = new URL(window.location);
-      var currentPage = parseInt(currentUrl.searchParams.get('page') || '1');
-      var originPage = parseInt(sessionStorage.getItem('jigScanOriginPage') || '1');
-      var nextPage = currentPage + 1;
-
-      // If we've wrapped back to origin, give up
-      if (nextPage === originPage || currentPage > 100) {
-        sessionStorage.removeItem('jigScanPendingLotId');
-        sessionStorage.removeItem('jigScanOriginPage');
-        sessionStorage.removeItem('jigScanPendingOpenAddJig');
-        sessionStorage.removeItem('jigScanPendingJigId');
-        var scanStatus = document.getElementById('pickTableScanStatus');
-        if (scanStatus) {
-          scanStatus.style.color = '#dc3545';
-          scanStatus.textContent = 'Lot not found!';
-          scanStatus.style.display = 'inline-block';
-        }
-        return;
-      }
-      currentUrl.searchParams.set('page', nextPage);
-      window.location.href = currentUrl.toString();
-    }
   });
 })();
 </script>

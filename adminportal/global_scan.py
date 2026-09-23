@@ -29,6 +29,95 @@ logger = logging.getLogger(__name__)
 
 SCAN_TAG = '[GLOBAL_SCAN_API]'
 
+def _normalize_excess_scan(value):
+    return ''.join(str(value or '').split()).upper()
+
+
+def _excess_entries(value):
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _legacy_source_lot(source):
+    """Match JigView's source-lot fallback for older multi-model snapshots."""
+    if source.is_multi_model:
+        draft = source.draft_data if isinstance(source.draft_data, dict) else {}
+        tray_map = {
+            item['tray_id']: item for item in _excess_entries(draft.get('tray_data'))
+            if item.get('tray_id')
+        }
+        if not tray_map:
+            tray_map = {
+                item['tray_id']: item for item in _excess_entries(source.delink_tray_info)
+                if item.get('tray_id')
+            }
+        for item in _excess_entries(source.half_filled_tray_info):
+            original = tray_map.get(item.get('tray_id'), {})
+            if original.get('source_lot_id'):
+                return original['source_lot_id']
+    return source.lot_id
+
+
+def find_active_excess_lot_by_tray(tray_ids):
+    """Return current excess ownership, never the historical parent lot.
+
+    Use the same submitted snapshot window and parent/batch/jig mapping as
+    JigView. Excess lots do not need the parent's Brass Audit acceptance flag.
+    This read-only lookup does not authorize loading or change tray quantities.
+    """
+    from Jig_Loading.models import ExcessLotRecord, ExcessLotTray, JigCompleted
+
+    variants = {_normalize_excess_scan(value) for value in tray_ids if _normalize_excess_scan(value)}
+    if not variants:
+        return None
+    sources = list(JigCompleted.objects.filter(
+        draft_status='submitted', half_filled_tray_qty__gt=0,
+    ).only(
+        'lot_id', 'batch_id', 'jig_id', 'half_filled_tray_info',
+        'is_multi_model', 'draft_data', 'delink_tray_info',
+    )[:50])
+    if not sources:
+        return None
+
+    records = {}
+    for record in ExcessLotRecord.objects.filter(
+        parent_lot_id__in={source.lot_id for source in sources},
+    ).order_by('-created_at'):
+        records.setdefault(
+            (record.parent_lot_id, record.parent_batch_id, record.jig_id), record,
+        )
+
+    tray_query = Q()
+    for value in variants:
+        tray_query |= Q(tray_id__iexact=value)
+    matching_records = set(ExcessLotTray.objects.filter(
+        tray_query, excess_lot_id__in=[record.pk for record in records.values()],
+        qty__gt=0,
+    ).values_list('excess_lot_id', flat=True))
+
+    for source in sources:
+        record = records.get((source.lot_id, source.batch_id, source.jig_id))
+        snapshot = _excess_entries(source.half_filled_tray_info)
+        matches = any(_normalize_excess_scan(item.get('tray_id')) in variants for item in snapshot)
+        # Match the view-icon fallback only when no snapshot trays are available.
+        if not matches and not (not snapshot and record and record.pk in matching_records):
+            continue
+        lot_id = record.new_lot_id if record else _legacy_source_lot(source)
+        later_submissions = JigCompleted.objects.filter(draft_status='submitted').exclude(pk=source.pk)
+        if later_submissions.filter(lot_id=lot_id).exists():
+            continue
+        consumed_as_secondary = any(
+            str(item.get('lot_id') or '') == str(lot_id)
+            for allocation in later_submissions.filter(is_multi_model=True).values_list(
+                'multi_model_allocation', flat=True,
+            )
+            for item in _excess_entries(allocation)
+        )
+        if consumed_as_secondary:
+            continue
+        return {'lot_id': str(lot_id), 'batch_id': str(source.batch_id or ''), 'source': 'JigLoadingExcess'}
+    return None
+
+
 # Global Scan - F2 shortcut in header triggers a POST request to this view with the scanned tray_id.
 class GlobalTraySearchView(LoginRequiredMixin, View):
     """
@@ -156,6 +245,67 @@ class GlobalTraySearchView(LoginRequiredMixin, View):
         for candidate in variants:
             query |= Q(**{f'{field_name}__iexact': candidate})
         return query
+
+    def _resolve_active_tray_lot_ids(self, tray_id):
+        """Return active physical-tray assignments before Nickel Wiping.
+
+        Nickel Wiping releases a tray by clearing and delinking its global
+        ``TrayId`` master record.  Some valid reuse paths create the new active
+        module tray row without reactivating that legacy master row, so F2 must
+        also read the active module assignment.  It deliberately never reads
+        Nickel Wiping or later records: those belong to a released lifecycle.
+        """
+        from modelmasterapp.models import TrayId
+        from InputScreening.models import IPTrayId
+        from Brass_QC.models import BrassTrayId
+        from BrassAudit.models import BrassAuditTrayId
+        from IQF.models import IQFTrayId
+        from Jig_Loading.models import JigLoadTrayId
+        from Jig_Unloading.models import JigUnload_TrayId
+
+        tray_query = self._tray_query(self._tray_id_variants(tray_id))
+        lot_ids = set()
+        batch_ids = set()
+
+        def collect(records):
+            for record in records:
+                if record.lot_id:
+                    lot_ids.add(str(record.lot_id))
+                batch_id = getattr(record, 'batch_id_id', None)
+                if batch_id:
+                    batch_ids.add(str(batch_id))
+
+        # Keep the normal global assignment path, when the master was updated.
+        collect(
+            TrayId.objects.filter(
+                tray_query, delink_tray=False, lot_id__isnull=False,
+            ).exclude(lot_id='').only('lot_id', 'batch_id')
+        )
+
+        # A reused tray can be represented only by its current module row.
+        # These are active, pre-release stages; history and Nickel records are
+        # intentionally excluded.
+        active_filters = {
+            'delink_tray': False,
+            'rejected_tray': False,
+            'lot_id__isnull': False,
+        }
+        for tray_model in (IPTrayId, BrassTrayId, BrassAuditTrayId, IQFTrayId, JigLoadTrayId):
+            collect(
+                tray_model.objects.filter(tray_query, **active_filters)
+                .exclude(lot_id='')
+                .only('lot_id', 'batch_id')
+            )
+
+        collect(
+            JigUnload_TrayId.objects.filter(
+                tray_query,
+                delink_tray=False,
+                rejected_tray=False,
+                lot_id__isnull=False,
+            ).exclude(lot_id='').only('lot_id')
+        )
+        return lot_ids, batch_ids
 
     def _tray_id_in_payload(self, payload, variants):
         variant_set = {str(value or '').upper() for value in variants if value}
@@ -429,10 +579,24 @@ class GlobalTraySearchView(LoginRequiredMixin, View):
         3. Return first module where lot is active
 
         Workflow: Day Planning ? Input Screening ? Brass QC ? Brass Audit ? IQF
-                  ? Spider Spindle ? Nickel Audit ? Nickel Wiping ? Jig Unloading ? Jig Loading
+                  ? Jig Loading ? Jig Unloading.  Nickel Wiping releases the
+                  physical tray, so Nickel and later modules are not F2 targets.
         """
-        # Step 1: Resolve candidates
-        lot_ids, batch_ids = self._resolve_candidate_lot_ids(tray_id, user=user)
+        # Excess trays remain in Jig Loading after their parent jig moves on.
+        # Resolve that physical tray ownership before historical lot candidates.
+        excess = find_active_excess_lot_by_tray(self._tray_id_variants(tray_id))
+        if excess:
+            return {'module': 'Jig Loading', 'url': reverse('JigView'), **excess}
+
+        # F2 also supports scanning a jig label on Jig Unloading screens. Keep
+        # that separate from physical-tray lookup; this resolver itself filters
+        # to active Jig Unloading records.
+        if self._is_jig_id_format(tray_id):
+            return self._resolve_jig_unloading_by_jig_id(tray_id)
+
+        # Step 1: Resolve the current physical-tray assignment only. The legacy
+        # resolver intentionally reads history, which is not valid for F2.
+        lot_ids, batch_ids = self._resolve_active_tray_lot_ids(tray_id)
         logger.info(
             '%s candidates_resolved tray_id=%s lot_ids=%s batch_ids=%s',
             SCAN_TAG,
@@ -445,26 +609,12 @@ class GlobalTraySearchView(LoginRequiredMixin, View):
             logger.info('%s no_candidates tray_id=%s', SCAN_TAG, tray_id)
             return None
 
-        # A scanned JIG ID must resolve to Jig Unloading Zone 1/2 before the
-        # lot-first workflow checks older/current upstream modules.
-        if self._is_jig_id_format(tray_id):
-            jig_unload_result = self._resolve_jig_unloading_by_jig_id(tray_id, lot_ids)
-            if jig_unload_result:
-                return jig_unload_result
-
         # Step 2: Check each module's eligible Main/Pick table only.
         # Completed/Reject/history tables are deliberately not eligible for
         # global scan navigation/highlighting.
         checks = [
             ('Inprocess Inspection', self._check_lot_in_inprocess_inspection),
             ('Jig Unloading',   self._check_lot_in_jig_unloading),
-            ('Inprocess Inspection', self._check_lot_in_inprocess_inspection),
-            ('Nickel Wiping',   self._check_lot_in_nickel_wiping),
-            ('Nickel Wiping Z2', self._check_lot_in_nickel_wiping_z2),
-            ('Nickel Audit Z1', self._check_lot_in_nickel_audit_z1),
-            ('Nickel Audit Z2', self._check_lot_in_nickel_audit_z2),
-            ('Spider Spindle Z1', self._check_lot_in_ss_z1),
-            ('Spider Spindle Z2', self._check_lot_in_ss_z2),
             ('IQF',             self._check_lot_in_iqf),
             ('Brass Audit',     self._check_lot_in_brass_audit),
             ('Brass QC',        self._check_lot_in_brass_qc),

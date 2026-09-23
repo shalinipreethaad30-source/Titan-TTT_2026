@@ -354,6 +354,24 @@
 
     function installKeyboardHandler() {
         document.addEventListener('keydown', function (event) {
+            if (isJigLoadingContext()) {
+                var scanning = typeof window._gScanIsActive === 'function' && window._gScanIsActive();
+                if ((isTypingTarget(event) || scanning) && event.key !== 'Escape') {
+                    if (event.key === 'Enter' && event.target && event.target.matches &&
+                        event.target.matches('.split-scan-input, .tray-id-input, #jigIdInput, #globalScanInput, #pickTableScanInput, #excessTopTrayScanInput')) {
+                        event.preventDefault();
+                    }
+                    resetPageJumpBuffer();
+                    return;
+                }
+            }
+            // Add Jig rebuilds scan inputs after validation. Focus may briefly
+            // belong to the page; barcode digits must never become page jumps.
+            // Leave all keys (including Escape) to the modal's own handlers.
+            if (isJigScanModalOpen()) {
+                resetPageJumpBuffer();
+                return;
+            }
             // Input Screening has scanner/remark/modal inputs that must own every
             // keystroke while focused. Do this before key lookup so DB settings
             // such as allow_when_typing cannot re-enable an application shortcut.
@@ -373,6 +391,12 @@
             var modalOpen = Boolean(getTopModalRoot()) || isShortcutPanelOpen();
             for (var candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
                 var config = candidates[candidateIndex];
+                // Digits from a scanner can arrive while focus is on the page.
+                // Jig Loading pagination remains available through its buttons.
+                if (isJigLoadingContext() && config.code === 'jump_page') {
+                    resetPageJumpBuffer();
+                    continue;
+                }
                 if (!matchesCurrentContext(config)) {
                     continue;
                 }
@@ -488,7 +512,7 @@
     function commitPageJump() {
         var digits = pageJumpDigits;
         resetPageJumpBuffer();
-        if (!digits) {
+        if (!digits || isJigLoadingContext() || isJigScanModalOpen()) {
             return;
         }
         goToPage(Number(digits));
@@ -1120,6 +1144,15 @@
         }
         var tagName = activeElement.tagName ? activeElement.tagName.toLowerCase() : '';
         return tagName === 'input' || tagName === 'textarea' || tagName === 'select' || activeElement.isContentEditable;
+    }
+
+    function isJigLoadingContext() {
+        return /^\/jig_loading\//i.test(window.location.pathname);
+    }
+
+    function isJigScanModalOpen() {
+        var modal = document.getElementById('jigAddModal');
+        return Boolean(modal && modal.classList.contains('open'));
     }
 
     function isInputScreeningContext() {

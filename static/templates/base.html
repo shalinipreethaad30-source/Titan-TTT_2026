@@ -3917,6 +3917,16 @@
   // "Not Exists". The destination page's auto-highlight script (further below in this
   // file) reads ?highlight=<trayId>&lot=<lotId> from the URL and highlights the row.
   function navigateToTrayModule(responseData, trayId) {
+    // Continuous Jig Loading scans must never navigate away from the work page.
+    if (/^\/jig_loading\//i.test(window.location.pathname)) {
+      const message = 'Available in ' + ((responseData && responseData.module) || 'another module');
+      scanInput.disabled = false;
+      setInfo('!', message, '#ff6b00');
+      setScanMessage(message, '#ff6b00');
+      if (scanResult) scanResult.textContent = message;
+      focusScanInput(true);
+      return;
+    }
     const targetUrl = responseData && responseData.url;
     if (!targetUrl) {
       handleTrayNotFound(trayId);
@@ -4038,6 +4048,12 @@
 
   function rowMatchesContext(row, context) {
     if (!row || !context || !context.identifiers || !context.identifiers.length) return false;
+    // An excess lot shares its batch with the submitted parent and possibly
+    // other excess cycles. Only its exact lot row is the scan destination.
+    if (context.responseData && context.responseData.source === 'JigLoadingExcess') {
+      return normalizeIdentifier(row.getAttribute('data-stock-lot-id') || row.getAttribute('data-lot-id')) ===
+        normalizeIdentifier(context.responseData.lot_id);
+    }
     const tokens = collectRowTokens(row);
     if (context.rowIdentifiers && context.rowIdentifiers.length) {
       return context.rowIdentifiers.some(function(identifier) {
