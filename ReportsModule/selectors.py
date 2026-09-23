@@ -1008,13 +1008,23 @@ def _jig_loading_cells(jig_record, prev_out_time=None, records=None, lot_id=None
             source_entry = records.entry(STAGE_JIG_LOADING, lot_id) if records else None
             source_submission = records.submission(STAGE_JIG_LOADING, lot_id) if records else None
             source_values = submission_values(STAGE_JIG_LOADING, source_submission)
+            # Keep the source lot quantity distinct from the quantity that
+            # actually fitted into this jig.  Example: a 50-qty added model
+            # can load 48 while the remaining 2 stays as balance.
+            source_lot_qty = (
+                source_values.get('lot_qty')
+                if source_values.get('lot_qty') is not None
+                else values.get('lot_qty')
+                if values.get('lot_qty') is not None
+                else allocation_qty(secondary)
+            )
             jig_cell = '\n'.join([
                 heading,
                 f'PLATING STK NO : {plating_stock_no or secondary.get("model") or secondary.get("model_no") or "--"}',
                 f'IN : {_fmt((source_entry or {}).get("in_time")) or _fmt((entry or {}).get("in_time")) or "--"}',
                 f'OUT: {_fmt(source_values.get("out_time")) or _fmt(values.get("out_time")) or "--"}',
                 f'JIG ID : {getattr(jig_record, "jig_id", None) or "--"}',
-                f'Lot Qty : {allocation_qty(secondary)}',
+                f'Lot Qty : {source_lot_qty}',
                 f'Broken Hook : {getattr(jig_record, "broken_hooks", 0) or 0}',
                 f'Loaded Qty : {allocation_qty(secondary)}',
                 'Status : Completed',
@@ -1831,14 +1841,28 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
     for unload in list(unload_candidates.values()):
         jig_ids = [item.strip() for item in str(unload.jig_qr_id or '').split(',') if item.strip()]
         # Jig IDs are reused over time; select the newest completed record
-        # for each ID in this combined unloading transaction.
+        # for each ID that existed before this unloading transaction.
         whole_jigs_by_id = {}
         if len(jig_ids) > 1:
-            for candidate in JigCompleted.objects.filter(jig_id__in=jig_ids).order_by('-pk'):
+            jig_candidates = JigCompleted.objects.filter(jig_id__in=jig_ids)
+            if unload.Un_loaded_date_time:
+                jig_candidates = jig_candidates.filter(
+                    IP_loaded_date_time__lte=unload.Un_loaded_date_time
+                )
+            for candidate in jig_candidates.order_by('-IP_loaded_date_time', '-pk'):
                 whole_jigs_by_id.setdefault(candidate.jig_id, candidate)
         whole_jigs = [whole_jigs_by_id[jig_id] for jig_id in jig_ids
                       if jig_id in whole_jigs_by_id]
-        if len(whole_jigs) == len(jig_ids) and sum(j.loaded_cases_qty or 0 for j in whole_jigs) == unload.total_case_qty:
+        whole_jig_stocks = {
+            str(getattr(jig, 'plating_stock_num', '') or '').strip()
+            for jig in whole_jigs
+            if str(getattr(jig, 'plating_stock_num', '') or '').strip()
+        }
+        if (
+            len(whole_jigs) == len(jig_ids)
+            and len(whole_jig_stocks) == 1
+            and sum(j.loaded_cases_qty or 0 for j in whole_jigs) == unload.total_case_qty
+        ):
             lines = ['Jig Unloading - Add Model', 'Plating Stk No : ' + str(getattr(whole_jigs[0], 'plating_stock_num', None) or '--')]
             combined_sources = set(unload.combine_lot_ids or [])
             for index, jig in enumerate(sorted(whole_jigs, key=lambda j: jig_ids.index(j.jig_id)), 1):
@@ -1871,7 +1895,23 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
                 qty = sum(int(m.get('qty') or 0) for m in mappings)
                 sources.update(str(m.get('lot_id')) for m in mappings if m.get('lot_id'))
                 details.append((jig, mappings[0], qty))
-            if len(details) > 1 and all((j.loaded_cases_qty if j else 0) == qty for j, _, qty in details):
+            detail_stocks = {
+                str(getattr(jig, 'plating_stock_num', '') or '').strip()
+                for jig, _, _ in details
+                if jig and str(getattr(jig, 'plating_stock_num', '') or '').strip()
+            }
+            valid_detail_times = all(
+                not unload.Un_loaded_date_time
+                or not getattr(jig, 'IP_loaded_date_time', None)
+                or jig.IP_loaded_date_time <= unload.Un_loaded_date_time
+                for jig, _, _ in details if jig
+            )
+            if (
+                len(details) > 1
+                and len(detail_stocks) == 1
+                and valid_detail_times
+                and all((j.loaded_cases_qty if j else 0) == qty for j, _, qty in details)
+            ):
                 lines = ['Jig Unloading - Add Model', 'Plating Stk No : ' + str(getattr(details[0][0], 'plating_stock_num', None) or '--')]
                 for index, (jig, mapping, qty) in enumerate(details, 1):
                     lines += ['IN TIME : ' + (_fmt(getattr(jig, 'IP_loaded_date_time', None)) or '--'), 'OUT TIME: ' + (_fmt(unload.Un_loaded_date_time) or '--'), f'Jig ID-{index} : ' + str(mapping.get('jig_id') or '--'), f'Jig ID-{index} Qty : {qty}']
@@ -1991,8 +2031,28 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
                 # transaction (for example, 98 + 98), display the add-model
                 # transaction as one two-jig record. Partial model shares
                 # such as 54 + 44 retain their individual source blocks.
+                source_stock_numbers = {
+                    str(detail['stock_no'] or '').strip()
+                    for detail in source_jig_details
+                    if str(detail['stock_no'] or '').strip()
+                }
+                timestamps_are_valid = all(
+                    not detail['in_time']
+                    or not detail['out_time']
+                    or detail['in_time'] <= detail['out_time']
+                    for detail in source_jig_details
+                )
                 is_full_jig_add_model = (
                     len(source_jig_details) > 1
+                    # Add Model is valid only when the combined jigs belong
+                    # to the same plating stock.  Never present mixed models
+                    # as one valid add-model unloading transaction.
+                    and len(source_stock_numbers) == 1
+                    # A source entry after the saved unloading time means the
+                    # data was paired with a historical jig record.  Keep it
+                    # out of the combined summary instead of publishing an
+                    # impossible IN/OUT sequence.
+                    and timestamps_are_valid
                     and all(
                         detail['jig_qty'] is not None
                         and detail['lot_qty'] == detail['jig_qty']

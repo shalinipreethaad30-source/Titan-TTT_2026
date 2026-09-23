@@ -2726,7 +2726,10 @@ def _consolidated_rows_from_request(request):
     )
 
 
-def _nickel_wiping_report_rows(rows):
+def _nickel_wiping_report_rows(rows, date_from=None, date_to=None, plating_stock_no=""):
+    if date_from and date_to and date_from > date_to:
+        date_from, date_to = date_to, date_from
+    plating_stock_no = plating_stock_no.strip().casefold()
     """Return each real Nickel Wiping receipt once, using its receipt qty."""
     nickel_rows = []
     seen_receipts = set()
@@ -2744,6 +2747,25 @@ def _nickel_wiping_report_rows(rows):
             continue
 
         wiping_lines = details.get(wiping_column, [])
+        # An added-model source row can carry the primary lot's downstream
+        # history in the upstream selector.  It is never a Nickel lot itself.
+        # Example: ``Lot Qty: 15; Note: Added with Primary Model`` followed by
+        # a primary 98-lot Wiping history.  Exclude the entire source row; the
+        # real physical Nickel lot is added below from the Pick Table ledger.
+        first_real_in_index = next(
+            (
+                index for index, line in enumerate(wiping_lines)
+                if str(line.get('label', '')).strip().lower() == 'in'
+                and str(line.get('value', '')).strip() not in ('', '--')
+            ),
+            len(wiping_lines),
+        )
+        leading_note = ' '.join(
+            str(line.get('value', '')) for line in wiping_lines[:first_real_in_index]
+            if str(line.get('label', '')).strip().lower() == 'note'
+        ).lower()
+        if 'added with primary model' in leading_note:
+            continue
         receipt_in = next(
             (line.get('value') for line in wiping_lines
              if str(line.get('label', '')).strip().lower() == 'in'
@@ -2779,6 +2801,79 @@ def _nickel_wiping_report_rows(rows):
                    if str(line.get('label', '')).strip().lower() not in history_labels]
             for name in downstream_columns
         }
+        # Added-model summaries belong to Jig Loading/Unloading, not Nickel
+        # Wiping.  Drop a block that has no actual Nickel IN time and only
+        # describes an added model (for example ``Lot Qty: 15; Note: Added``).
+        wiping_blocks = []
+        active_wiping_block = []
+        for line in clean_details.get(wiping_column, []):
+            label = str(line.get('label', '')).strip().lower()
+            starts_next_block = (
+                label == 'plating stk no'
+                or (label == 'in' and any(str(item.get('label', '')).strip().lower() == 'status' for item in active_wiping_block))
+            )
+            if starts_next_block and active_wiping_block:
+                wiping_blocks.append(active_wiping_block)
+                active_wiping_block = []
+            active_wiping_block.append(line)
+        if active_wiping_block:
+            wiping_blocks.append(active_wiping_block)
+        if wiping_blocks:
+            valid_wiping_blocks = []
+            for block in wiping_blocks:
+                labels = {str(line.get('label', '')).strip().lower() for line in block}
+                has_real_in = any(
+                    str(line.get('label', '')).strip().lower() == 'in'
+                    and str(line.get('value', '')).strip() not in ('', '--')
+                    for line in block
+                )
+                is_added_summary = 'note' in labels and not has_real_in
+                if not is_added_summary:
+                    valid_wiping_blocks.append(block)
+            clean_details[wiping_column] = [line for block in valid_wiping_blocks for line in block]
+
+        # Older Nickel history may contain an intermediate partial-quantity
+        # record and its physical-lot record with exactly the same operation
+        # time and result.  They are one Wiping pass, so retain the larger
+        # physical quantity (for example 98) instead of showing a 95 + 98
+        # duplicate block.
+        existing_blocks = []
+        active_block = []
+        for line in clean_details.get(wiping_column, []):
+            label = str(line.get('label', '')).strip().lower()
+            starts_next_block = (
+                label == 'plating stk no'
+                or (label == 'in' and any(str(item.get('label', '')).strip().lower() == 'status' for item in active_block))
+            )
+            if starts_next_block and active_block:
+                existing_blocks.append(active_block)
+                active_block = []
+            active_block.append(line)
+        if active_block:
+            existing_blocks.append(active_block)
+        retained_blocks = []
+        block_signatures = {}
+        for block in existing_blocks:
+            values = {
+                str(line.get('label', '')).strip().lower(): str(line.get('value', '')).strip()
+                for line in block
+            }
+            signature = tuple(values.get(name, '') for name in ('in', 'out', 'accepted', 'rejected', 'status'))
+            try:
+                quantity = float(values.get('lot qty', '0').replace(',', ''))
+            except ValueError:
+                quantity = 0
+            previous_index = block_signatures.get(signature)
+            if previous_index is None:
+                block_signatures[signature] = len(retained_blocks)
+                retained_blocks.append((quantity, block))
+            elif quantity > retained_blocks[previous_index][0]:
+                retained_blocks[previous_index] = (quantity, block)
+        if retained_blocks:
+            clean_details[wiping_column] = [
+                line for _, block in retained_blocks for line in block
+            ]
+
         nickel_rows.append({
             's_no': len(nickel_rows) + 1,
             'source_s_no': row.get('s_no'),
@@ -2794,6 +2889,41 @@ def _nickel_wiping_report_rows(rows):
     # Jig Unloading quantity (for example 294), never its component lots.
     Tray = apps.get_model('Nickel_Inspection', 'NickelQcTrayId')
     Unload = apps.get_model('Jig_Unloading', 'JigUnloadAfterTable')
+    NickelSubmission = apps.get_model('Nickel_Inspection', 'NickelQC_Submission')
+    AuditSubmission = apps.get_model('Nickel_Audit', 'NickelAudit_Submission')
+    # The report ledger is the union of current Pick Table receipts and all
+    # saved Wiping/Audit submissions.  Completed lots must not disappear just
+    # because they are no longer pending in the Pick Table.
+    nickel_ledger_lot_ids = set(Tray.objects.exclude(lot_id__isnull=True).exclude(lot_id='').values_list('lot_id', flat=True))
+    nickel_ledger_lot_ids.update(NickelSubmission.objects.values_list('lot_id', flat=True))
+    nickel_ledger_lot_ids.update(AuditSubmission.objects.values_list('lot_id', flat=True))
+    # Accepted continuations are downstream identities, not new Wiping
+    # receipts. Follow the explicit parent links, never stock/quantity matches.
+    accepted_parents = {}
+    for app_label, model_name in (
+        ('Nickel_Inspection', 'NickelQC_PartialAcceptLot'),
+        ('Nickel_Audit', 'NickelAudit_PartialAcceptLot'),
+    ):
+        for child, parent in apps.get_model(app_label, model_name).objects.values_list('new_lot_id', 'parent_lot_id'):
+            if child and parent and child != parent:
+                accepted_parents[child] = parent
+    for child, parent in apps.get_model('Nickel_Inspection', 'NickelWiping_PartialAcceptRecord').objects.values_list('child_lot_id', 'source_lot_id'):
+        if child and parent and child != parent:
+            accepted_parents.setdefault(child, parent)
+
+    def _receipt_root(lot_id):
+        visited = set()
+        while lot_id in accepted_parents:
+            if lot_id in visited:
+                raise ValueError('Cycle in Nickel accepted-lot lineage')
+            visited.add(lot_id)
+            lot_id = accepted_parents[lot_id]
+        return lot_id
+
+    receipt_members = {}
+    for lot_id in nickel_ledger_lot_ids | set(accepted_parents):
+        receipt_members.setdefault(_receipt_root(lot_id), set()).add(lot_id)
+
     tray_entries = {
         row['lot_id']: row
         for row in Tray.objects.exclude(lot_id__isnull=True).exclude(lot_id='')
@@ -2879,59 +3009,244 @@ def _nickel_wiping_report_rows(rows):
             for item in nickel_rows
         )
 
-    def _append_physical_nickel_lot(unload):
-        """Append one real Nickel Pick Table lot for one physical unload."""
+    def _append_physical_nickel_lot(unload, force_current_row=False):
+        """Append one physical Nickel lot and its persisted Wiping/Audit journey."""
         entry = tray_entries.get(unload.lot_id)
         if getattr(unload.plating_color, 'jig_unload_zone_2', False):
-            zone = 'Nickel Wiping Z2'
+            zone, audit_zone = 'Nickel Wiping Z2', 'Nickel Audit Z2'
         elif getattr(unload.plating_color, 'jig_unload_zone_1', False):
-            zone = 'Nickel Wiping Z1'
+            zone, audit_zone = 'Nickel Wiping Z1', 'Nickel Audit Z1'
         else:
             return
-        entry_time = (
-            entry['in_time'] if entry else
-            getattr(unload, 'nq_last_process_date_time', None) or unload.created_at
-        )
-        if _has_reported_physical_lot(unload, zone, entry_time):
+        entry_time = getattr(unload, 'Un_loaded_date_time', None) or (entry['in_time'] if entry else unload.created_at)
+        if not force_current_row and _has_reported_physical_lot(unload, zone, entry_time):
             return
-        value = timezone.localtime(entry_time).strftime('%d-%b-%Y %I:%M %p') if entry_time else '--'
-        details = {name: [] for name in columns}
-        details[zone] = [
-            {'label': 'PLATING STK NO', 'value': unload.plating_stk_no or ''},
-            {'label': 'IN', 'value': value}, {'label': 'OUT', 'value': '--'},
-            {'label': 'LOT QTY', 'value': unload.total_case_qty},
-            {'label': 'STATUS', 'value': 'In Progress'},
-        ]
-        # The preview reads ``module_details``.  The Excel exporter writes
-        # ``modules``; populate both representations so a combined physical
-        # unload (for example 294) cannot appear as a blank Nickel row.
-        module_text = '\n'.join(
-            '{} : {}'.format(line['label'], line['value'])
-            for line in details[zone]
-        )
+
+        NickelSubmission = apps.get_model('Nickel_Inspection', 'NickelQC_Submission')
+        AuditSubmission = apps.get_model('Nickel_Audit', 'NickelAudit_Submission')
+        member_ids = receipt_members.get(unload.lot_id, set()) | {unload.lot_id}
+        wiping_events = list(NickelSubmission.objects.filter(lot_id__in=member_ids).order_by('created_at', 'pk'))
+        audit_events = list(AuditSubmission.objects.filter(lot_id__in=member_ids).order_by('created_at', 'pk'))
+
+        def _format_timestamp(moment):
+            return timezone.localtime(moment).strftime('%d-%b-%Y %I:%M %p') if moment else '--'
+
+        def _status(submission_type):
+            value = str(submission_type or '').upper()
+            if 'FULL_ACCEPT' in value:
+                return 'Accepted'
+            if 'FULL_REJECT' in value:
+                return 'Rejected'
+            if 'PARTIAL' in value:
+                return 'Partially Accepted'
+            return value.replace('_', ' ').title() or 'Completed'
+
+        def _event_lines(event, in_time, include_stock=True):
+            lines = []
+            if include_stock:
+                lines.append({'label': 'PLATING STK NO', 'value': unload.plating_stk_no or ''})
+            lines.extend([
+                {'label': 'IN', 'value': _format_timestamp(in_time)},
+                {'label': 'OUT', 'value': _format_timestamp(event.created_at)},
+                {'label': 'LOT QTY', 'value': event.total_lot_qty or unload.total_case_qty},
+                {'label': 'ACCEPTED', 'value': event.accepted_qty or 0},
+                {'label': 'REJECTED', 'value': event.rejected_qty or 0},
+                {'label': 'STATUS', 'value': _status(event.submission_type)},
+            ])
+            return lines
+
+        details, states = ({name: [] for name in columns}, {})
+        for event in wiping_events:
+            prior_audits = [audit for audit in audit_events if audit.created_at <= event.created_at]
+            in_time = prior_audits[-1].created_at if prior_audits else entry_time
+            if details[zone]:
+                details[zone].append({'label': '', 'value': ''})
+            details[zone].extend(_event_lines(event, in_time, include_stock=not details[zone]))
+            states[zone] = 'completed'
+        for event in audit_events:
+            prior_wiping = [wiping for wiping in wiping_events if wiping.created_at <= event.created_at]
+            in_time = prior_wiping[-1].created_at if prior_wiping else entry_time
+            if details[audit_zone]:
+                details[audit_zone].append({'label': '', 'value': ''})
+            details[audit_zone].extend(_event_lines(event, in_time, include_stock=not details[audit_zone]))
+            states[audit_zone] = 'completed'
+
+        last_wiping = wiping_events[-1] if wiping_events else None
+        last_audit = audit_events[-1] if audit_events else None
+        if not wiping_events:
+            details[zone] = [
+                {'label': 'PLATING STK NO', 'value': unload.plating_stk_no or ''},
+                {'label': 'IN', 'value': _format_timestamp(entry_time)}, {'label': 'OUT', 'value': '--'},
+                {'label': 'LOT QTY', 'value': unload.total_case_qty}, {'label': 'STATUS', 'value': 'In Progress'},
+            ]
+            states[zone] = 'current'
+        elif last_audit and last_audit.created_at >= last_wiping.created_at and 'FULL_REJECT' in str(last_audit.submission_type or '').upper():
+            details[zone].append({'label': '', 'value': ''})
+            details[zone].extend([
+                {'label': 'IN', 'value': _format_timestamp(last_audit.created_at)}, {'label': 'OUT', 'value': '--'},
+                {'label': 'LOT QTY', 'value': last_audit.total_lot_qty or unload.total_case_qty}, {'label': 'STATUS', 'value': 'In Progress'},
+            ])
+            states[zone] = 'current'
+        elif last_wiping.accepted_qty and (not last_audit or last_wiping.created_at > last_audit.created_at):
+            if details[audit_zone]:
+                details[audit_zone].append({'label': '', 'value': ''})
+            details[audit_zone].extend([
+                {'label': 'IN', 'value': _format_timestamp(last_wiping.created_at)}, {'label': 'OUT', 'value': '--'},
+                {'label': 'LOT QTY', 'value': last_wiping.accepted_qty}, {'label': 'STATUS', 'value': 'In Progress'},
+            ])
+            states[audit_zone] = 'current'
+
+        completed_at = None
+        # Audit accepted output continues to Spider on the same receipt row.
+        if last_audit and last_audit.accepted_qty and (not last_wiping or last_audit.created_at >= last_wiping.created_at):
+            spider_zone = zone.replace('Nickel Wiping', 'Spider Spindle')
+            suffix = 'z2' if zone.endswith('Z2') else 'z1'
+            members = list(Unload.objects.filter(lot_id__in=member_ids))
+            completed_at = max((getattr(member, 'ss_' + suffix + '_completed_at', None)
+                                for member in members
+                                if getattr(member, 'ss_' + suffix + '_completed', False)
+                                and getattr(member, 'ss_' + suffix + '_completed_at', None)), default=None)
+            details[spider_zone] = [
+                {'label': 'PLATING STK NO', 'value': unload.plating_stk_no or ''},
+                {'label': 'IN', 'value': _format_timestamp(last_audit.created_at)},
+                {'label': 'OUT', 'value': _format_timestamp(completed_at)},
+                {'label': 'LOT QTY', 'value': last_audit.accepted_qty},
+                {'label': 'STATUS', 'value': 'Completed' if completed_at else 'In Progress'},
+            ]
+            states[spider_zone] = 'completed' if completed_at else 'current'
+
+        # Match the upstream report's latest-activity date semantics while
+        # keeping every pass of a matching physical receipt together.
+        if plating_stock_no and plating_stock_no not in (unload.plating_stk_no or '').casefold():
+            return
+        if date_from or date_to:
+            activity_times = [entry_time, completed_at] + [
+                event.created_at for event in wiping_events + audit_events
+            ]
+            latest_activity = max((moment for moment in activity_times if moment), default=None)
+            if latest_activity is None:
+                return
+            activity_date = timezone.localtime(latest_activity).date()
+            if date_from and activity_date < date_from:
+                return
+            if date_to and activity_date > date_to:
+                return
+
+        # Render every transition as an independently coloured block.  This is
+        # the same presentation used by the established 144-lot journey:
+        # accepted/rejected history is green and only the live returned block
+        # is blue, rather than colouring the entire column as current.
+        for module, lines in details.items():
+            block_number = 0
+            clean_lines = []
+            for line in lines:
+                if not line.get('label') and not line.get('value'):
+                    block_number += 1
+                    continue
+                line['block'] = block_number
+                clean_lines.append(line)
+            if clean_lines:
+                final_block = clean_lines[-1]['block']
+                for line in clean_lines:
+                    line['block_state'] = (
+                        'current'
+                        if states.get(module) == 'current' and line['block'] == final_block
+                        else 'completed'
+                    )
+            details[module] = clean_lines
+            # Block states control the preview colour; do not apply a single
+            # cell-wide state after a lot has re-entered Nickel Wiping.
+            if clean_lines:
+                states.pop(module, None)
+
+        # Keep the downstream report grid explicit.  The opposite zone cannot
+        # receive this physical lot (Not Applicable); the matching-zone stages
+        # that have not yet received it are Not Reached.
+        zone_suffix = 'Z2' if zone.endswith('Z2') else 'Z1'
+        for module in columns:
+            if details[module]:
+                continue
+            is_matching_zone = module.endswith(zone_suffix)
+            status = 'Not Reached' if is_matching_zone else 'Not Applicable'
+            details[module] = [
+                {'label': 'PLATING STK NO', 'value': unload.plating_stk_no or ''},
+                {'label': 'IN', 'value': '--'}, {'label': 'OUT', 'value': '--'},
+                {'label': 'LOT QTY', 'value': '--'}, {'label': 'STATUS', 'value': status},
+            ]
+            states[module] = 'not_reached' if is_matching_zone else 'not_applicable'
+
         modules = {name: '' for name in columns}
-        modules[zone] = module_text
+        for module, lines in details.items():
+            module_blocks = []
+            current_block = None
+            current_lines = []
+            for line in lines:
+                if current_block is not None and line.get('block') != current_block:
+                    module_blocks.append('\n'.join(current_lines))
+                    current_lines = []
+                current_block = line.get('block')
+                current_lines.append('{} : {}'.format(line['label'], line['value']) if line['label'] else '')
+            if current_lines:
+                module_blocks.append('\n'.join(current_lines))
+            # Excel has no visual block borders, so separate each pass with
+            # a blank line while keeping the preview's block layout unchanged.
+            modules[module] = '\n\n'.join(module_blocks).strip()
         nickel_rows.append({
             's_no': len(nickel_rows) + 1, 'source_s_no': None,
             'plating_stk_no': unload.plating_stk_no or '', 'lot_qty': unload.total_case_qty,
-            'modules': modules,
-            'module_states': {zone: 'current'}, 'module_details': details, 'remarks': '',
+            'modules': modules, 'module_states': states, 'module_details': details, 'remarks': '',
         })
-
     # The Pick Table is backed by physical JigUnloadAfterTable records.  Add
     # every pending single-jig physical lot as well as each combined parent.
     # Component jig IDs belonging to an Add Model parent are excluded so a
     # 294 unload never becomes three 98 Nickel lots.
     component_jig_ids = set().union(*combined_jig_groups) if combined_jig_groups else set()
-    physical_unloads = list(combined_unloads)
+    # Use the same secondary-model rule as the Nickel Wiping Pick Table.  A
+    # Jig Unloading trace row created for an added source lot (4/44, etc.) is
+    # not a Nickel lot and must never be emitted by this report.
+    from Jig_Loading.models import JigCompleted
+    from Jig_Unloading.tray_utils import normalize_combine_lot_id
+
+    secondary_lot_ids = set()
+    for model_record in JigCompleted.objects.filter(
+        is_multi_model=True,
+        multi_model_allocation__isnull=False,
+    ).only('lot_id', 'multi_model_allocation'):
+        allocations = model_record.multi_model_allocation or []
+        primary_model = next(
+            (
+                str(item.get('model') or item.get('model_name') or '').strip()
+                for item in allocations
+                if isinstance(item, dict) and item.get('lot_id') == model_record.lot_id
+            ),
+            '',
+        )
+        for item in allocations:
+            if not isinstance(item, dict) or item.get('lot_id') == model_record.lot_id:
+                continue
+            model_name = str(item.get('model') or item.get('model_name') or '').strip()
+            if primary_model and model_name and model_name == primary_model:
+                secondary_lot_ids.add(item.get('lot_id'))
+
+    def _is_secondary_pick_table_source(unload):
+        source_ids = {
+            normalize_combine_lot_id(value)
+            for value in (unload.combine_lot_ids or [])
+            if normalize_combine_lot_id(value)
+        }
+        return bool(source_ids) and source_ids.issubset(secondary_lot_ids)
+
+    # Match the Nickel Pick Table: every row that is currently eligible there
+    # is a physical Nickel lot, even when an earlier Jig operation had a
+    # combined parent quantity.  A completed/returned lot is also retained
+    # whenever it has a saved Nickel ledger event.
+    physical_unloads = []
     for unload in Unload.objects.filter(total_case_qty__gt=0).select_related('plating_color'):
-        jig_ids = [part.strip() for part in str(unload.jig_qr_id or '').split(',') if part.strip()]
         is_nickel_zone = (
             getattr(unload.plating_color, 'jig_unload_zone_1', False)
             or getattr(unload.plating_color, 'jig_unload_zone_2', False)
         )
-        is_single_component = len(jig_ids) == 1 and jig_ids[0] in component_jig_ids
-        is_pending_pick_lot = (
+        is_active_pick_lot = (
             not getattr(unload, 'nq_qc_accptance', False)
             and not getattr(unload, 'nq_qc_rejection', False)
             and not (
@@ -2939,15 +3254,41 @@ def _nickel_wiping_report_rows(rows):
                 and not getattr(unload, 'nq_onhold_picking', False)
             )
         )
-        if len(jig_ids) == 1 and is_nickel_zone and not is_single_component and is_pending_pick_lot:
+        is_saved_nickel_lot = (
+            unload.lot_id in nickel_ledger_lot_ids
+            or getattr(unload, 'nq_last_process_date_time', None) is not None
+            or getattr(unload, 'na_last_process_date_time', None) is not None
+        )
+        if (
+            is_nickel_zone
+            and not _is_secondary_pick_table_source(unload)
+            and unload.lot_id not in accepted_parents
+            and (is_active_pick_lot or is_saved_nickel_lot)
+        ):
             physical_unloads.append(unload)
 
+    # Build only receipt rows. Never retain upstream selector placeholders or
+    # accepted child rows alongside the authoritative physical receipts.
+    nickel_rows = []
+
     for unload in physical_unloads:
-        _append_physical_nickel_lot(unload)
+        # The Pick Table/unload ledger is the source of truth for Nickel
+        # quantity and timestamps.  Do not keep an upstream cell when it has
+        # a different added-model or parent quantity.
+        _append_physical_nickel_lot(unload, force_current_row=True)
 
     for index, item in enumerate(nickel_rows, start=1):
         item['s_no'] = index
     return nickel_rows
+
+
+def _nickel_rows_from_request(request, rows):
+    return _nickel_wiping_report_rows(
+        rows,
+        date_from=_parse_report_date(request.GET.get('date_from')),
+        date_to=_parse_report_date(request.GET.get('date_to')),
+        plating_stock_no=(request.GET.get('plating_stk_no') or '').strip(),
+    )
 
 
 def _attach_nickel_report_rows(rows, nickel_rows):
@@ -2967,18 +3308,22 @@ def consolidated_report_preview(request):
         logger.exception('Consolidated report preview failed')
         return JsonResponse({'error': 'Failed to build preview'}, status=500)
 
-    paginator = Paginator(rows, 10)
+    nickel_rows = _nickel_rows_from_request(request, rows)
+    paginator = Paginator(range(max(len(rows), len(nickel_rows))), 10)
     try:
         page_number = int(request.GET.get('page', 1))
     except (TypeError, ValueError):
         page_number = 1
     page = paginator.get_page(page_number)
-    page_rows = list(page.object_list)
-    nickel_rows = _nickel_wiping_report_rows(page_rows)
+    page_indices = list(page.object_list)
+    page_rows = [rows[index] if index < len(rows) else {} for index in page_indices]
+    page_nickel_rows = [nickel_rows[index] if index < len(nickel_rows) else {} for index in page_indices]
 
     return JsonResponse({
         'results': page_rows,
-        'nickel_results': nickel_rows,
+        'nickel_results': page_nickel_rows,
+        'upstream_total_records': len(rows),
+        'nickel_total_records': len(nickel_rows),
         'page': page.number,
         'num_pages': paginator.num_pages,
         'total_records': paginator.count,
@@ -2997,30 +3342,30 @@ def consolidated_report_download(request):
         logger.exception('Consolidated report download failed')
         return HttpResponse('Failed to build report', status=500)
 
-    if not rows:
+    nickel_rows = _nickel_rows_from_request(request, rows)
+    if not rows and not nickel_rows:
         return HttpResponse('No data found', status=404)
-
-    nickel_rows = _nickel_wiping_report_rows(rows)
     nickel_columns = NICKEL_WIPING_REPORT_COLUMNS[3:-1]
     excel_rows = []
-    for index, row in enumerate(rows):
+    for index in range(max(len(rows), len(nickel_rows))):
+        row = rows[index] if index < len(rows) else {}
         nickel = nickel_rows[index] if index < len(nickel_rows) else {}
         upstream_modules = {
-            name: row['modules'].get(name, '')
+            name: row.get('modules', {}).get(name, '')
             for name in CONSOLIDATED_COLUMNS[3:12]
         }
         nickel_modules = {name: '' for name in nickel_columns}
         nickel_modules.update(nickel.get('modules', {}))
         excel_rows.append({
-            'S.No': row['s_no'],
-            'Plating Stock No.': row['plating_stk_no'],
-            'Lot Qty': row['lot_qty'],
+            'S.No': row.get('s_no', ''),
+            'Plating Stock No.': row.get('plating_stk_no', ''),
+            'Lot Qty': row.get('lot_qty', ''),
             **upstream_modules,
             'Nickel S.No': nickel.get('s_no', ''),
             'Nickel Plating Stock No.': nickel.get('plating_stk_no', ''),
             'Nickel Lot Qty': nickel.get('lot_qty', ''),
             **nickel_modules,
-            'Remarks': row['remarks'],
+            'Remarks': row.get('remarks', ''),
         })
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -3051,3 +3396,17 @@ def plating_stock_autocomplete(request):
         logger.exception('Plating stock autocomplete failed')
         results = []
     return JsonResponse({'results': results})
+
+
+
+
+
+
+
+
+
+
+
+
+
+
