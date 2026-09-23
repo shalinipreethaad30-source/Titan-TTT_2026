@@ -1740,10 +1740,10 @@ html.ttt-viewport-tablet .is-pick-table-page #order-listing th.is-vertical-stick
           </div>
 
           <!-- Reject + Accept columns (Reject first in DOM for scan order, but side by side) -->
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+          <div id="trayAllocationColumns" style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
 
             <!-- REJECT Section (ERR1: reject first) -->
-            <div style="border:1px solid #ffcdd2; border-radius:8px; padding:10px; background:#fff8f8;">
+            <div id="rejectTraySection" style="border:1px solid #ffcdd2; border-radius:8px; padding:10px; background:#fff8f8;">
               <h6 style="margin:0 0 4px; font-weight:600; color:#c62828; font-size:13px;">
                 <i class="fa fa-times-circle"></i> Reject Trays
                 <span style="float:right; font-size:12px; color:#b71c1c;">Qty: <strong id="rejectTotalQtyLabel">0</strong></span>
@@ -2974,6 +2974,8 @@ document.addEventListener('DOMContentLoaded', function() {
     const originalTraysContainer = document.getElementById('originalTraysContainer');
     const acceptSlotsContainer = document.getElementById('acceptSlotsContainer');
     const rejectSlotsContainer = document.getElementById('rejectSlotsContainer');
+    const rejectTraySection = document.getElementById('rejectTraySection');
+    const trayAllocationColumns = document.getElementById('trayAllocationColumns');
     const acceptTotalQtyLabel = document.getElementById('acceptTotalQtyLabel');
     const rejectTotalQtyLabel = document.getElementById('rejectTotalQtyLabel');
     const delinkSection = document.getElementById('delinkSection');
@@ -2992,6 +2994,7 @@ document.addEventListener('DOMContentLoaded', function() {
     let _acceptSlots = [];  // {qty, is_top, tray_id}
     let _rejectSlots = [];
     let _allocateTimer = null;
+    const REJECT_QTY_DEBOUNCE_MS = 1500;
     let _allocationGeneration = 0; // incremented when scan starts; invalidates stale fetchAllocation responses
     let _reuseCount = 0;
     let _reuseTrayIds = [];
@@ -3276,79 +3279,125 @@ document.addEventListener('DOMContentLoaded', function() {
 
       reasonsGrid.querySelectorAll('.reject-qty-input').forEach(function(inp) {
         inp.addEventListener('input', function() {
-          // ERR 2 FIX: Reject qty changed — immediately wipe all scan slot assignments
-          // so the user cannot submit stale tray data against a new allocation plan.
-          _rejectSlots.forEach(function(s) { s.tray_id = null; });
-          _acceptSlots.forEach(function(s) { s.tray_id = null; });
-          _delinkSlots = [];
-          if (_rejectSlots.length) {
-            renderSlots(rejectSlotsContainer, _rejectSlots, 'reject');
-            renderSlots(acceptSlotsContainer, _acceptSlots, 'accept');
-          }
-          renderDelinkSlots();
-          delinkSection.style.display = 'none';
-          setAcceptSectionEnabled(false);
-          renderOriginalTrays();
-          updateTotals();
+          // Keep quantity labels responsive while the user is typing, but do NOT
+          // rebuild tray state yet. This prevents a first digit (e.g. "1" of "14")
+          // from moving focus before the complete value is entered.
+          updateRejectQuantityDisplay();
+
+          // Any allocation response already in flight belongs to the old quantity.
+          // Invalidate it immediately, then commit only after 2 seconds of idle typing.
+          _allocationGeneration++;
+          if (_allocateTimer) clearTimeout(_allocateTimer);
+          _allocateTimer = setTimeout(function() {
+            _allocateTimer = null;
+            commitRejectQuantityChange();
+          }, REJECT_QTY_DEBOUNCE_MS);
         });
 
-        // Enter commits the reason qty immediately and hands off to the tray
-        // scan input, instead of leaving the scanner's next keystrokes to land
-        // back in this (still-focused) number field.
+        // Enter commits the complete reason quantity immediately.
         inp.addEventListener('keydown', function(e) {
           if (e.key !== 'Enter') return;
           e.preventDefault();
+          flushAllocation();
           this.blur();
         });
 
-        // Blur (Enter above, or Tab/click-away) flushes the pending debounce
-        // right away so the reject tray scan input exists and is focused
-        // before the user's next scan arrives.
+        // Tab/click-away also commits immediately. flushAllocation() is guarded,
+        // so Enter -> blur cannot create a duplicate ALLOCATE request.
         inp.addEventListener('blur', function() {
           flushAllocation();
         });
       });
     }
 
-    // ── Immediately run the allocation fetch, but only if one is actually
-    //    pending. Without this guard, the blur our own focusNextAvailableTrayInput()
-    //    triggers (when it steals focus from the qty field into the freshly
-    //    rendered scan input) would re-enter here and fire a redundant second
-    //    ALLOCATE call — one that can resolve after the user has already scanned
-    //    a tray and wipe it out, since fetchAllocation always rebuilds slots empty. ──
-    function flushAllocation() {
-      if (!_allocateTimer) return; // nothing pending — already up to date
-      clearTimeout(_allocateTimer);
-      _allocateTimer = null;
+    function getTotalRejectQty() {
       var totalReject = 0;
       reasonsGrid.querySelectorAll('.reject-qty-input').forEach(function(inp) {
         totalReject += parseInt(inp.value || '0', 10);
       });
-      if (totalReject > 0 && totalReject <= _totalQty && !fullLotCb.checked) {
+      return totalReject;
+    }
+
+    function setRejectTraySectionVisibility(totalReject) {
+      if (!rejectTraySection || !trayAllocationColumns) return;
+      var showReject = totalReject > 0 && !fullLotCb.checked;
+      rejectTraySection.style.display = showReject ? '' : 'none';
+      trayAllocationColumns.style.gridTemplateColumns = showReject ? '1fr 1fr' : '1fr';
+    }
+
+    // Lightweight update only: safe to run on every keystroke.
+    function updateRejectQuantityDisplay() {
+      var totalReject = getTotalRejectQty();
+      totalDisplay.textContent = totalReject;
+      remainDisplay.textContent = Math.max(0, _totalQty - totalReject);
+      setRejectTraySectionVisibility(totalReject);
+      errorDiv.textContent = '';
+      return totalReject;
+    }
+
+    // Destructive tray reset/allocation happens only after typing settles,
+    // or immediately on Enter/blur.
+    function commitRejectQuantityChange() {
+      var totalReject = updateRejectQuantityDisplay();
+
+      _rejectSlots.forEach(function(s) { s.tray_id = null; });
+      _acceptSlots.forEach(function(s) { s.tray_id = null; });
+      _delinkSlots = [];
+      if (_rejectSlots.length || _acceptSlots.length) {
+        renderSlots(rejectSlotsContainer, _rejectSlots, 'reject');
+        renderSlots(acceptSlotsContainer, _acceptSlots, 'accept');
+      }
+      renderDelinkSlots();
+      delinkSection.style.display = 'none';
+      setAcceptSectionEnabled(false);
+      renderOriginalTrays();
+
+      if (fullLotCb.checked) {
+        allocationSection.style.display = 'none';
+        return;
+      }
+
+      if (totalReject > 0 && totalReject <= _totalQty) {
         fetchAllocation(totalReject);
+      } else {
+        // Never send ALLOCATE with rejected_qty = 0 (or an invalid over-total qty).
+        allocationSection.style.display = 'none';
+        setRejectTraySectionVisibility(0);
       }
     }
 
-    // ── Update totals + trigger allocation ──
+    // Run the pending quantity commit immediately. The timer is cleared before
+    // commit so Enter -> blur cannot submit the allocation twice.
+    function flushAllocation() {
+      if (!_allocateTimer) return;
+      clearTimeout(_allocateTimer);
+      _allocateTimer = null;
+      commitRejectQuantityChange();
+    }
+
+    // Programmatic updates (draft restore, Full Lot, Clear All) keep the existing
+    // behavior. Direct user typing uses the dedicated 2-second debounce above.
     function updateTotals() {
-      var totalReject = 0;
-      reasonsGrid.querySelectorAll('.reject-qty-input').forEach(function(inp) {
-        totalReject += parseInt(inp.value || '0', 10);
-      });
-      totalDisplay.textContent = totalReject;
-      remainDisplay.textContent = Math.max(0, _totalQty - totalReject);
+      var totalReject = updateRejectQuantityDisplay();
+
+      if (_allocateTimer) {
+        clearTimeout(_allocateTimer);
+        _allocateTimer = null;
+      }
 
       if (totalReject > 0 && totalReject <= _totalQty) {
-        // ERR8: Skip allocation when Full Lot Rejection is checked
         if (fullLotCb.checked) {
           allocationSection.style.display = 'none';
         } else {
-          // Debounce allocation call
-          if (_allocateTimer) clearTimeout(_allocateTimer);
-          _allocateTimer = setTimeout(function() { fetchAllocation(totalReject); }, 300);
+          _allocateTimer = setTimeout(function() {
+            _allocateTimer = null;
+            commitRejectQuantityChange();
+          }, 300);
         }
       } else {
+        _allocationGeneration++;
         allocationSection.style.display = 'none';
+        setRejectTraySectionVisibility(0);
       }
       errorDiv.textContent = '';
     }
@@ -3444,6 +3493,7 @@ document.addEventListener('DOMContentLoaded', function() {
           updateSummary();
         }
         allocationSection.style.display = '';
+        setRejectTraySectionVisibility(resp.rejected_qty || 0);
         // Auto-focus first reject tray scan input so the scanner can type straight
         // into it without the user needing to click the field first.
         focusNextAvailableTrayInput();

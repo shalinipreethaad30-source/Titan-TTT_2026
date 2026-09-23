@@ -12,7 +12,8 @@ from Brass_QC.models import BrassTrayId, Brass_Qc_Accepted_TrayScan, Brass_QC_Re
 from IQF.models import IQFTrayId, IQF_Accepted_TrayScan, IQF_Rejected_TrayScan, IQF_Accepted_TrayID_Store
 from BrassAudit.models import BrassAuditTrayId, Brass_Audit_Accepted_TrayScan, Brass_Audit_Rejected_TrayScan, Brass_Audit_Accepted_TrayID_Store
 from django.core.paginator import Paginator
-from django.db.models import OuterRef, Subquery, Sum, IntegerField, Count
+from django.db.models import OuterRef, Subquery, Sum, IntegerField, Count, Min
+from django.apps import apps
 from django.utils import timezone
 import logging
 import pytz
@@ -2684,10 +2685,18 @@ CONSOLIDATED_COLUMNS = [
     'Day Planning', 'Input Screening', 'Brass QC', 'IQF', 'Brass Audit',
     'Jig Loading', 'IP Inspection',
     'Jig Unloading Z1', 'Jig Unloading Z2',
+    'Nickel S.No', 'Nickel Plating Stock No.', 'Nickel Lot Qty',
     'Nickel Wiping Z1', 'Nickel Wiping Z2',
     'Nickel Audit Z1', 'Nickel Audit Z2',
     'Spider Spindle Z1', 'Spider Spindle Z2',
     'Remarks',
+]
+
+NICKEL_WIPING_REPORT_COLUMNS = [
+    'S.No', 'Plating Stock No.', 'Lot Qty',
+    'Nickel Wiping Z1', 'Nickel Wiping Z2',
+    'Nickel Audit Z1', 'Nickel Audit Z2',
+    'Spider Spindle Z1', 'Spider Spindle Z2', 'Remarks',
 ]
 
 
@@ -2717,6 +2726,237 @@ def _consolidated_rows_from_request(request):
     )
 
 
+def _nickel_wiping_report_rows(rows):
+    """Return each real Nickel Wiping receipt once, using its receipt qty."""
+    nickel_rows = []
+    seen_receipts = set()
+    wiping_columns = ('Nickel Wiping Z1', 'Nickel Wiping Z2')
+    for row in rows:
+        modules = row.get('modules', {})
+        details = row.get('module_details', {})
+        states = row.get('module_states', {})
+        wiping_column = next(
+            (name for name in wiping_columns
+             if states.get(name) in ('current', 'completed')),
+            None,
+        )
+        if not wiping_column:
+            continue
+
+        wiping_lines = details.get(wiping_column, [])
+        receipt_in = next(
+            (line.get('value') for line in wiping_lines
+             if str(line.get('label', '')).strip().lower() == 'in'
+             and line.get('value') not in (None, '', '--')),
+            None,
+        )
+        # Added-model notes are explanatory only. A Nickel report row exists
+        # only after the physical lot has entered Nickel Wiping.
+        if receipt_in is None:
+            continue
+
+        lot_qty = None
+        for line in wiping_lines:
+            if str(line.get('label', '')).strip().lower() == 'lot qty':
+                value = line.get('value')
+                if value not in (None, '', '--'):
+                    lot_qty = value
+                    break
+        if lot_qty is None:
+            continue
+
+        receipt_key = (modules.get(wiping_column, ''), receipt_in, str(lot_qty))
+        if receipt_key in seen_receipts:
+            continue
+        seen_receipts.add(receipt_key)
+
+        downstream_columns = (
+            'Nickel Wiping Z1', 'Nickel Wiping Z2', 'Nickel Audit Z1',
+            'Nickel Audit Z2', 'Spider Spindle Z1', 'Spider Spindle Z2')
+        history_labels = {'previous history', 'current info', 'm1', 'm2', 'total lot qty'}
+        clean_details = {
+            name: [line for line in details.get(name, [])
+                   if str(line.get('label', '')).strip().lower() not in history_labels]
+            for name in downstream_columns
+        }
+        nickel_rows.append({
+            's_no': len(nickel_rows) + 1,
+            'source_s_no': row.get('s_no'),
+            'plating_stk_no': row.get('plating_stk_no', ''),
+            'lot_qty': lot_qty,
+            'modules': {name: modules.get(name, '') for name in downstream_columns},
+            'module_states': {name: states.get(name) for name in downstream_columns},
+            'module_details': clean_details,
+            'remarks': row.get('remarks', ''),
+        })
+    # The upstream journey view can omit a combined Jig Unloading record.
+    # Add real Nickel Wiping Pick Table lots directly, using the physical
+    # Jig Unloading quantity (for example 294), never its component lots.
+    Tray = apps.get_model('Nickel_Inspection', 'NickelQcTrayId')
+    Unload = apps.get_model('Jig_Unloading', 'JigUnloadAfterTable')
+    tray_entries = {
+        row['lot_id']: row
+        for row in Tray.objects.exclude(lot_id__isnull=True).exclude(lot_id='')
+        .values('lot_id').annotate(in_time=Min('date'))
+    }
+    combined_unloads = list(
+        Unload.objects.filter(jig_qr_id__contains=',', total_case_qty__gt=0)
+        .select_related('plating_color')
+    )
+    combined_jig_groups = [
+        {
+            jig_id.strip()
+            for jig_id in str(unload.jig_qr_id or '').split(',')
+            if jig_id.strip()
+        }
+        for unload in combined_unloads
+    ]
+    # A single jig can have several upstream journey rows (primary and added
+    # model rows).  Its Jig Unloading record is the physical lot that reaches
+    # Nickel, so only that output quantity is allowed into this report.
+    unload_qty_by_jig = {}
+    for unload in Unload.objects.filter(total_case_qty__gt=0):
+        jig_ids = [part.strip() for part in str(unload.jig_qr_id or '').split(',') if part.strip()]
+        if len(jig_ids) == 1:
+            unload_qty_by_jig.setdefault(jig_ids[0], set()).add(str(unload.total_case_qty))
+
+    def _source_unload_jig_ids(source_row):
+        """Read jig IDs from structured report lines, never rendered HTML."""
+        jig_ids = set()
+        for stage in ('Jig Unloading Z1', 'Jig Unloading Z2'):
+            for line in source_row.get('module_details', {}).get(stage, []):
+                label = str(line.get('label', '')).strip().lower()
+                if label.startswith('jig id'):
+                    jig_id = str(line.get('value', '')).strip()
+                    if jig_id and jig_id != '--':
+                        jig_ids.add(jig_id)
+        return jig_ids
+
+    source_rows = {row.get('s_no'): row for row in rows}
+    # Remove every source component of an Add Model unload.  For example,
+    # three source 98 lots become one Nickel lot of 294.  Also remove an
+    # added-model source quantity such as 4/44 when the physical unload for
+    # that jig is 144/98 respectively.
+    filtered_rows = []
+    for item in nickel_rows:
+        source_jigs = _source_unload_jig_ids(
+            source_rows.get(item.get('source_s_no'), {})
+        )
+        # A report row that contains every jig from the combined unload is the
+        # parent output and may already carry its complete Nickel history.
+        # A row with only one/some of those jigs is a source component.
+        is_combined_component = any(
+            source_jigs & group and source_jigs != group
+            for group in combined_jig_groups
+        )
+        matches_physical_output = not source_jigs or any(
+            str(item.get('lot_qty')) in unload_qty_by_jig.get(jig_id, set())
+            for jig_id in source_jigs
+        )
+        if not is_combined_component and matches_physical_output:
+            filtered_rows.append(item)
+    nickel_rows = filtered_rows
+    for index, item in enumerate(nickel_rows, start=1):
+        item['s_no'] = index
+    columns = (
+        'Nickel Wiping Z1', 'Nickel Wiping Z2', 'Nickel Audit Z1',
+        'Nickel Audit Z2', 'Spider Spindle Z1', 'Spider Spindle Z2')
+
+    def _wiping_in(item, zone):
+        return next(
+            (str(line.get('value')) for line in item.get('module_details', {}).get(zone, [])
+             if str(line.get('label', '')).strip().lower() == 'in'),
+            '',
+        )
+
+    def _has_reported_physical_lot(unload, zone, entry_time):
+        """Do not duplicate a rich selector row already tied to this receipt."""
+        expected_in = timezone.localtime(entry_time).strftime('%d-%b-%Y %I:%M %p') if entry_time else '--'
+        return any(
+            str(item.get('plating_stk_no') or '') == str(unload.plating_stk_no or '')
+            and str(item.get('lot_qty')) == str(unload.total_case_qty)
+            and _wiping_in(item, zone) == expected_in
+            for item in nickel_rows
+        )
+
+    def _append_physical_nickel_lot(unload):
+        """Append one real Nickel Pick Table lot for one physical unload."""
+        entry = tray_entries.get(unload.lot_id)
+        if getattr(unload.plating_color, 'jig_unload_zone_2', False):
+            zone = 'Nickel Wiping Z2'
+        elif getattr(unload.plating_color, 'jig_unload_zone_1', False):
+            zone = 'Nickel Wiping Z1'
+        else:
+            return
+        entry_time = (
+            entry['in_time'] if entry else
+            getattr(unload, 'nq_last_process_date_time', None) or unload.created_at
+        )
+        if _has_reported_physical_lot(unload, zone, entry_time):
+            return
+        value = timezone.localtime(entry_time).strftime('%d-%b-%Y %I:%M %p') if entry_time else '--'
+        details = {name: [] for name in columns}
+        details[zone] = [
+            {'label': 'PLATING STK NO', 'value': unload.plating_stk_no or ''},
+            {'label': 'IN', 'value': value}, {'label': 'OUT', 'value': '--'},
+            {'label': 'LOT QTY', 'value': unload.total_case_qty},
+            {'label': 'STATUS', 'value': 'In Progress'},
+        ]
+        # The preview reads ``module_details``.  The Excel exporter writes
+        # ``modules``; populate both representations so a combined physical
+        # unload (for example 294) cannot appear as a blank Nickel row.
+        module_text = '\n'.join(
+            '{} : {}'.format(line['label'], line['value'])
+            for line in details[zone]
+        )
+        modules = {name: '' for name in columns}
+        modules[zone] = module_text
+        nickel_rows.append({
+            's_no': len(nickel_rows) + 1, 'source_s_no': None,
+            'plating_stk_no': unload.plating_stk_no or '', 'lot_qty': unload.total_case_qty,
+            'modules': modules,
+            'module_states': {zone: 'current'}, 'module_details': details, 'remarks': '',
+        })
+
+    # The Pick Table is backed by physical JigUnloadAfterTable records.  Add
+    # every pending single-jig physical lot as well as each combined parent.
+    # Component jig IDs belonging to an Add Model parent are excluded so a
+    # 294 unload never becomes three 98 Nickel lots.
+    component_jig_ids = set().union(*combined_jig_groups) if combined_jig_groups else set()
+    physical_unloads = list(combined_unloads)
+    for unload in Unload.objects.filter(total_case_qty__gt=0).select_related('plating_color'):
+        jig_ids = [part.strip() for part in str(unload.jig_qr_id or '').split(',') if part.strip()]
+        is_nickel_zone = (
+            getattr(unload.plating_color, 'jig_unload_zone_1', False)
+            or getattr(unload.plating_color, 'jig_unload_zone_2', False)
+        )
+        is_single_component = len(jig_ids) == 1 and jig_ids[0] in component_jig_ids
+        is_pending_pick_lot = (
+            not getattr(unload, 'nq_qc_accptance', False)
+            and not getattr(unload, 'nq_qc_rejection', False)
+            and not (
+                getattr(unload, 'nq_qc_few_cases_accptance', False)
+                and not getattr(unload, 'nq_onhold_picking', False)
+            )
+        )
+        if len(jig_ids) == 1 and is_nickel_zone and not is_single_component and is_pending_pick_lot:
+            physical_unloads.append(unload)
+
+    for unload in physical_unloads:
+        _append_physical_nickel_lot(unload)
+
+    for index, item in enumerate(nickel_rows, start=1):
+        item['s_no'] = index
+    return nickel_rows
+
+
+def _attach_nickel_report_rows(rows, nickel_rows):
+    """Attach the downstream report identity to its upstream source row."""
+    by_source = {item['source_s_no']: item for item in nickel_rows}
+    for row in rows:
+        row['nickel_report'] = by_source.get(row.get('s_no'))
+
+
 @login_required(login_url='login')
 @require_admin
 def consolidated_report_preview(request):
@@ -2733,9 +2973,12 @@ def consolidated_report_preview(request):
     except (TypeError, ValueError):
         page_number = 1
     page = paginator.get_page(page_number)
+    page_rows = list(page.object_list)
+    nickel_rows = _nickel_wiping_report_rows(page_rows)
 
     return JsonResponse({
-        'results': list(page.object_list),
+        'results': page_rows,
+        'nickel_results': nickel_rows,
         'page': page.number,
         'num_pages': paginator.num_pages,
         'total_records': paginator.count,
@@ -2757,16 +3000,28 @@ def consolidated_report_download(request):
     if not rows:
         return HttpResponse('No data found', status=404)
 
-    excel_rows = [
-        {
+    nickel_rows = _nickel_wiping_report_rows(rows)
+    nickel_columns = NICKEL_WIPING_REPORT_COLUMNS[3:-1]
+    excel_rows = []
+    for index, row in enumerate(rows):
+        nickel = nickel_rows[index] if index < len(nickel_rows) else {}
+        upstream_modules = {
+            name: row['modules'].get(name, '')
+            for name in CONSOLIDATED_COLUMNS[3:12]
+        }
+        nickel_modules = {name: '' for name in nickel_columns}
+        nickel_modules.update(nickel.get('modules', {}))
+        excel_rows.append({
             'S.No': row['s_no'],
             'Plating Stock No.': row['plating_stk_no'],
             'Lot Qty': row['lot_qty'],
-            **row['modules'],
+            **upstream_modules,
+            'Nickel S.No': nickel.get('s_no', ''),
+            'Nickel Plating Stock No.': nickel.get('plating_stk_no', ''),
+            'Nickel Lot Qty': nickel.get('lot_qty', ''),
+            **nickel_modules,
             'Remarks': row['remarks'],
-        }
-        for row in rows
-    ]
+        })
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         pd.DataFrame(excel_rows, columns=CONSOLIDATED_COLUMNS).to_excel(

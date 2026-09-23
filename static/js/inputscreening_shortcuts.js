@@ -423,14 +423,18 @@
   // ─── Global keydown handler ────────────────────────────────────────────────
 
   function _onKeydown(e) {
-    // F2 — always intercept, regardless of focus (changed from F1)
+    // Editable controls own every keystroke. This guard is intentionally before
+    // F2/Escape so no application shortcut fires while typing or scanning.
+    if (_isTyping()) return;
+
+    // F2 — intercept only when focus is not in an editable control
     if (e.key === "F2") {
       e.preventDefault();
       _openGlobalScanPopup();
       return;
     }
 
-    // Escape — always intercept, regardless of focus
+    // Escape — intercept only when focus is not in an editable control
     if (e.key === "Escape") {
       e.preventDefault();
       _closeTopPopup();
@@ -446,8 +450,9 @@
     var _isrm = document.getElementById("isRejectModal");
     if (_isrm && _isrm.classList.contains("open")) return;
 
-    // All other shortcuts: skip when user is typing, or when any modal/popup is open
-    if (_isTyping() || _isModalOpen()) return;
+    // All other shortcuts: skip when any modal/popup is open. Editable focus
+    // was already handled by the common guard at the top of this function.
+    if (_isModalOpen()) return;
 
     switch (e.key) {
       case "a":
@@ -551,31 +556,6 @@
         _openGlobalScanPopup();
       });
     }
-
-    // Capture-phase guard (ERR4): when the IS Reject Modal is open, block
-    // any click that would open the eye-icon view modal in the background
-    // (hardware scanners can emit a stray Enter that bubbles through to the
-    // delegated handler in inputscreening_picktable.js). We also re-focus
-    // the active scan input so the operator can keep scanning.
-    document.addEventListener(
-      "click",
-      function (e) {
-        var modal = document.getElementById("isRejectModal");
-        if (!modal || !modal.classList.contains("open")) return;
-        var viewBtn = e.target.closest(".tray-scan-btn-DayPlanning-view");
-        if (!viewBtn) return;
-        e.preventDefault();
-        e.stopPropagation();
-        if (typeof e.stopImmediatePropagation === "function") {
-          e.stopImmediatePropagation();
-        }
-        var inp = modal.querySelector(
-          ".isrm-scan-input:not([readonly]):not([disabled])"
-        );
-        if (inp) inp.focus();
-      },
-      true
-    );
 
     // Expose tvmClose globally (may be needed by Esc handler before tvmClose
     // is set by inputscreening_picktable.js).  The picktable script overwrites

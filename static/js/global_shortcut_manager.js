@@ -354,6 +354,13 @@
 
     function installKeyboardHandler() {
         document.addEventListener('keydown', function (event) {
+            // Input Screening has scanner/remark/modal inputs that must own every
+            // keystroke while focused. Do this before key lookup so DB settings
+            // such as allow_when_typing cannot re-enable an application shortcut.
+            if (isInputScreeningContext() && isTypingTarget(event)) {
+                return;
+            }
+
             var normalizedKey = normalizeEventKey(event);
             if (shouldDeferToInputScreeningScan(event, normalizedKey)) {
                 return;
@@ -1100,13 +1107,23 @@
         return childElement ? childElement.getAttribute(attributeName) || '' : '';
     }
 
-    function isTypingTarget() {
-        var activeElement = document.activeElement;
+    function isTypingTarget(event) {
+        var activeElement = event && event.target ? event.target : document.activeElement;
+        if (activeElement && activeElement.nodeType === 3) {
+            activeElement = activeElement.parentElement;
+        }
         if (!activeElement) {
             return false;
         }
+        if (activeElement.closest) {
+            return Boolean(activeElement.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])'));
+        }
         var tagName = activeElement.tagName ? activeElement.tagName.toLowerCase() : '';
         return tagName === 'input' || tagName === 'textarea' || tagName === 'select' || activeElement.isContentEditable;
+    }
+
+    function isInputScreeningContext() {
+        return window.location.pathname.toLowerCase().indexOf('/inputscreening/') !== -1;
     }
 
     function matchesCurrentContext(config) {

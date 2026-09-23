@@ -256,7 +256,8 @@
                            data-moved-to-d-picker="{{ data.Moved_to_D_Picker }}"
                            data-tray-qty-list="{{ data.tray_qty_list|default:'[]'|safe }}"
                            data-ip-person-qty-verified="{{ data.ip_person_qty_verified|yesno:'true,false' }}"
-                           data-total-batch-quantity="{{ data.total_batch_quantity }}">
+                           data-total-batch-quantity="{{ data.total_batch_quantity }}"
+                           onclick="event.preventDefault(); if (typeof window.tvmOpen === 'function') { window.tvmOpen(this.dataset.stockLotId, this.dataset.batchId); } return false;">
                         <img src="{% static 'assets/icons/view.png' %}"
                            alt="View"
                            style="width: 20px; margin-right: 8px; height: auto; cursor:pointer;" />
@@ -1256,11 +1257,11 @@ document.addEventListener("DOMContentLoaded", function () {
     return true;
   }
 
-  function isTvmTypingTarget() {
-    var el = document.activeElement;
-    if (!el) return false;
-    var tag = el.tagName ? el.tagName.toLowerCase() : "";
-    return tag === "input" || tag === "textarea" || tag === "select" || el.isContentEditable;
+  function isTvmTypingTarget(event) {
+    var el = event && event.target;
+    if (el && el.nodeType === 3) el = el.parentElement;
+    if (!el || !el.closest) return false;
+    return Boolean(el.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])'));
   }
 
   document.addEventListener("keydown", function (event) {
@@ -1270,12 +1271,9 @@ document.addEventListener("DOMContentLoaded", function () {
 
     var key = event.key || "";
 
-    // Don't let letter-key shortcuts (c/d/o) interrupt the user while they are
-    // typing/scanning into an input inside this modal. Escape and Enter are
-    // exempt: Escape must always close, and Enter is how the scan input itself
-    // is submitted while typing/scanning.
-    var isLetterShortcut = key === "c" || key === "C" || key === "d" || key === "D" || key === "o" || key === "O";
-    if (isLetterShortcut && isTvmTypingTarget()) return;
+    // Editable controls own every keystroke. Do not dispatch any application
+    // shortcut while typing/scanning; scanner Enter remains element-owned.
+    if (isTvmTypingTarget(event)) return;
 
     var handled = false;
 

@@ -731,15 +731,8 @@ body.dp-completed-no-page-x-scroll .main-panel .content-wrapper.dp-completed-tab
     </div>
   </span>
 </td>
-                  <!-- Action (with View icon) -->
+                  <!-- Action (View only - no delete action in DP Completed Table) -->
                   <td>
-                    <span style="opacity:0.5; pointer-events:none; display:inline-block;">
-                      <!-- <img src="{% static 'assets/icons/edit1.png' %}" alt="Edit Disabled" style="width: 20px; margin-right: 8px; height: auto; filter: grayscale(1) opacity(0.5);" /> -->
-                    </span>
-                    <span style="opacity:0.5; pointer-events:none; display:inline-block;">
-                      <img src="{% static 'assets/icons/bin.png' %}" alt="Delete Disabled" style="width: 20px; margin-right: 8px; height: auto; filter: grayscale(1) opacity(0.5);" />
-                    </span>
-                    <!-- Add View icon for tray validation -->
                     <a
                       href="#"
                       title="View Tray Details"
@@ -753,48 +746,14 @@ body.dp-completed-no-page-x-scroll .main-panel .content-wrapper.dp-completed-tab
                       data-tray-qty-list="{{ row.tray_qty_list|default:'[]'|safe }}"
                       data-total-batch-quantity="{{ row.total_batch_quantity }}"
                       data-lot-status="{{ row.lot_status|default:'Yet to Release' }}">
-
-  <!-- Delete icon - DP Admin ONLY -->
-    {% if is_admin %}
-    <a
-        href="#"
-        title="Delete"
-        class="delete-dp-row-btn"
-        data-batch-id="{{ row.batch_id }}"
-        style="display: inline-block; cursor: pointer;">
-
-        <img
-            src="{% static 'assets/icons/delete.png' %}"
-            alt="Delete"
-            style="width: 20px; height: auto; cursor:pointer;"
-        />
-    </a>
-    {% endif %}
-    <!-- View icon - visible for both DP Admin and DP Normal User -->
-    <a
-        href="#"
-        title="View Tray Details"
-        class="text-primary tray-scan-btn-Jig"
-        style="text-decoration: underline"
-        data-batch-id="{{ row.batch_id }}"
-        data-model-no="{{ row.plating_stk_no }}"
-        data-no-of-trays="{{ row.no_of_trays }}"
-        data-tray-capacity="{{ row.tray_capacity|default:'0' }}"
-        data-moved-to-d-picker="{{ row.Moved_to_D_Picker }}"
-        data-tray-qty-list="{{ row.tray_qty_list|default:'[]'|safe }}"
-        data-total-batch-quantity="{{ row.total_batch_quantity }}"
-        data-lot-status="{{ row.lot_status|default:'Yet to Release' }}">
-
-        <img
-            src="{% static 'assets/icons/view.png' %}"
-            alt="View"
-            class="tray-scan-view-img"
-            style="width: 20px; margin-right: 8px; height: auto; cursor:pointer;"
-        />
-    </a>
-
-    
-</td>
+                      <img
+                        src="{% static 'assets/icons/view.png' %}"
+                        alt="View"
+                        class="tray-scan-view-img"
+                        style="width: 20px; margin-right: 8px; height: auto; cursor:pointer;"
+                      />
+                    </a>
+                  </td>
                   <!-- No of Tray -->
                   <td>{{ row.no_of_trays }}</td>
                   <!-- Input Qty -->

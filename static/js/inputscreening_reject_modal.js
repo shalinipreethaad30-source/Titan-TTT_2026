@@ -1585,11 +1585,23 @@
       });
   }
 
+  // ── Shortcut safety: application shortcuts must never fire while the
+  // user is typing, selecting, or scanning in an editable control.
+  function isEditableShortcutTarget(event) {
+    var target = event && event.target;
+    if (target && target.nodeType === 3) target = target.parentElement;
+    if (!target || !target.closest) return false;
+    return Boolean(target.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])'));
+  }
+
   // ── Wire-up ────────────────────────────────────────────────
   document.addEventListener("DOMContentLoaded", function () {
     document.addEventListener("keydown", function (e) {
       var modal = $("isRejectModal");
       if (!modal || !modal.classList.contains("open") || e.key !== "Enter") return;
+      // Editable controls own their keystrokes. Scanner inputs keep their own
+      // element-level Enter handler; remarks/other inputs keep normal typing.
+      if (isEditableShortcutTarget(e)) return;
       if (e.target && e.target.closest && e.target.closest(".swal2-container, .isrm-scan-input")) return;
       var pendingInput = modal.querySelector('.isrm-scan-input[data-scan-pending="1"]');
       if (pendingInput) {
@@ -1631,6 +1643,9 @@
       var modal = $("isRejectModal");
       if (!modal || !modal.classList.contains("open")) return;
       if (document.querySelector(".swal2-container")) return;
+      // Do not dispatch ANY modal shortcut from an editable target. This
+      // protects current and future shortcut keys, not only D/C/O.
+      if (isEditableShortcutTarget(e)) return;
       if (e.ctrlKey || e.metaKey || e.altKey) return;
 
       if (e.key === "Escape" || e.key === "c" || e.key === "C") {

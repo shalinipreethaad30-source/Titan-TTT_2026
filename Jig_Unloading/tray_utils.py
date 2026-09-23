@@ -362,13 +362,127 @@ def _has_allowed_lot(record_lot_aliases, allowed_aliases):
     return bool(record_lot_aliases and allowed_aliases and record_lot_aliases & allowed_aliases)
 
 
-def find_jig_unload_tray_conflict(raw_tray_id, allowed_lot_ids=None, include_tray_master=False):
-    """Return a conflict dict when a tray is reserved by another active lot.
+def _context_value(context, *keys):
+    for key in keys:
+        value = (context or {}).get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ''
+
+
+def _context_int(context, *keys):
+    value = _context_value(context, *keys)
+    if not value:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalise_assignment_context(context):
+    if not context:
+        return {}
+
+    normalised = dict(context)
+    model_value = _context_value(context, 'model_no', 'model_number')
+    if model_value:
+        normalised['model_key'] = model_value.upper()
+
+    lot_aliases = set()
+    for key in ('lot_id', 'main_lot_id', 'primary_lot_id'):
+        lot_aliases.update(_lot_id_aliases(context.get(key)))
+    for key in ('combined_lot_ids', 'source_lot_ids'):
+        values = context.get(key) or []
+        if isinstance(values, (list, tuple, set)):
+            for lot_id in values:
+                lot_aliases.update(_lot_id_aliases(lot_id))
+    normalised['lot_aliases'] = lot_aliases
+    return normalised
+
+
+def _same_model(record_model, assignment_context):
+    model_key = assignment_context.get('model_key')
+    if not model_key:
+        return False
+    return str(record_model or '').strip().upper() == model_key
+
+
+def _same_submitted_assignment(submitted, assignment_context):
+    submitted_id = _context_int(assignment_context, 'submitted_id', 'record_id')
+    if submitted_id and submitted.id == submitted_id:
+        return True
+
+    current_jig_completed_id = _context_int(assignment_context, 'jig_completed_id')
+    if not current_jig_completed_id or submitted.jig_completed_id != current_jig_completed_id:
+        return False
+
+    if not _same_model(submitted.model_no, assignment_context):
+        return False
+
+    current_lots = assignment_context.get('lot_aliases') or set()
+    submitted_lots = _lot_id_aliases(submitted.lot_id)
+    return bool(current_lots and submitted_lots and current_lots & submitted_lots)
+
+
+def _same_draft_assignment(draft, assignment_context):
+    draft_id = _context_int(assignment_context, 'draft_id')
+    if draft_id and draft.draft_id == draft_id:
+        return True
+
+    if not _same_model(draft.model_number, assignment_context):
+        return False
+
+    current_lots = assignment_context.get('lot_aliases') or set()
+    draft_lots = _lot_id_aliases(draft.main_lot_id)
+    for combined_lot_id in draft.combined_lot_ids or []:
+        draft_lots.update(_lot_id_aliases(combined_lot_id))
+    return bool(current_lots and draft_lots and current_lots & draft_lots)
+
+
+def _same_autosave_assignment(autosave, assignment_context):
+    autosave_id = _context_int(assignment_context, 'autosave_id')
+    if autosave_id and autosave.id == autosave_id:
+        return True
+
+    if not _same_model(autosave.model_number, assignment_context):
+        return False
+
+    current_lots = assignment_context.get('lot_aliases') or set()
+    autosave_lots = _lot_id_aliases(autosave.main_lot_id)
+    for combined_lot_id in autosave.combined_lot_ids or []:
+        autosave_lots.update(_lot_id_aliases(combined_lot_id))
+    if not (current_lots and autosave_lots and current_lots & autosave_lots):
+        return False
+
+    current_jig_id = _context_value(assignment_context, 'jig_id')
+    autosave_jig_id = str(autosave.jig_id or '').strip()
+    if current_jig_id and autosave_jig_id and current_jig_id != autosave_jig_id:
+        return False
+
+    current_user_id = _context_int(assignment_context, 'user_id')
+    if current_user_id and autosave.user_id:
+        return autosave.user_id == current_user_id
+
+    current_session_key = _context_value(assignment_context, 'session_key')
+    if current_session_key and autosave.session_key:
+        return autosave.session_key == current_session_key
+
+    return not current_user_id and not current_session_key
+
+
+def find_jig_unload_tray_conflict(
+    raw_tray_id,
+    allowed_lot_ids=None,
+    include_tray_master=False,
+    current_assignment=None,
+):
+    """Return a conflict dict when a tray is reserved by another active owner.
 
     Jig Unloading keeps in-progress tray scans in JSON-backed draft/autosave
     records before final submit. Those records must reserve tray IDs just like
     final tray rows, otherwise the same physical tray can be scanned into a
-    second lot while the first lot is still pending submission.
+    second assignment while the first assignment is still active.
     """
     tray_id = normalize_jig_unload_tray_id(raw_tray_id)
     tray_variants = _tray_id_variants(tray_id)
@@ -376,22 +490,11 @@ def find_jig_unload_tray_conflict(raw_tray_id, allowed_lot_ids=None, include_tra
         return None
 
     allowed_aliases = _allowed_lot_aliases(allowed_lot_ids)
+    assignment_context = _normalise_assignment_context(current_assignment)
 
     from modelmasterapp.models import TrayId
     from Jig_Unloading.models import JigUnload_TrayId, JigUnloadDraft, JigUnloadAutoSave, JUSubmittedZ1
     from Jig_Loading.models import ExcessLotTray
-
-    # A tray that has been officially delinked in the TrayId master (CLAUDE.md
-    # §7 "Delink Rules" — the authoritative state update) is free for reuse even
-    # if an older submitted/draft/autosave JSON payload still lists it. The
-    # JSON-backed branches below have no per-tray delink flag of their own
-    # (unlike the JigUnload_TrayId branch, which already skips delinked rows),
-    # so honour the master delink state and skip them to avoid blocking a
-    # legitimately released tray forever. Live occupancy is still enforced by
-    # the JigUnload_TrayId branch, which only matches non-delinked rows.
-    master_delinked = TrayId.objects.filter(
-        _variant_query('tray_id', tray_variants), delink_tray=True
-    ).exists()
 
     if include_tray_master:
         for excess_tray in ExcessLotTray.objects.filter(_variant_query('tray_id', tray_variants)).select_related(
@@ -435,8 +538,6 @@ def find_jig_unload_tray_conflict(raw_tray_id, allowed_lot_ids=None, include_tra
         if tray.delink_tray:
             continue
         record_lots = _lot_id_aliases(tray.lot_id)
-        if _has_allowed_lot(record_lots, allowed_aliases):
-            continue
         return _make_tray_conflict(
             tray_id,
             'Jig Unloading submitted trays',
@@ -444,26 +545,44 @@ def find_jig_unload_tray_conflict(raw_tray_id, allowed_lot_ids=None, include_tra
             tray.id,
         )
 
-    if master_delinked:
-        # Tray was officially released in the master — the stale JSON-backed
-        # references below no longer represent an active reservation.
-        return None
-
     submitted_rows = JUSubmittedZ1.objects.exclude(tray_data__isnull=True).only(
-        'id', 'jig_completed_id', 'lot_id', 'tray_data', 'is_draft'
+        'id', 'jig_completed_id', 'model_no', 'lot_id', 'tray_data', 'is_draft'
     )
     for submitted in submitted_rows.iterator():
         if not _payload_contains_tray_id(submitted.tray_data, tray_variants):
             continue
         record_lots = _lot_id_aliases(submitted.lot_id)
         record_lots.update(_collect_lot_aliases_from_payload(submitted.tray_data))
-        if _has_allowed_lot(record_lots, allowed_aliases):
+        if _same_submitted_assignment(submitted, assignment_context):
             continue
+
+        # A completed JUSubmittedZ1 row is historical traceability, not a
+        # permanent tray reservation.  Once a downstream process legitimately
+        # releases/delinks the physical tray, TrayId is marked delink_tray=True
+        # and scanned=False.  Do not let that old submitted JSON reserve the
+        # tray forever.
+        #
+        # IMPORTANT: drafts are deliberately NOT bypassed here.  An active JU
+        # draft/model-save must continue reserving its scanned tray so the same
+        # physical tray cannot be assigned to another active unload.
+        if (
+            not submitted.is_draft
+            and _is_jig_unload_tray_master_released(tray_id)
+        ):
+            logger.info(
+                "Ignoring historical JUSubmittedZ1 tray reservation for released "
+                "tray_id=%s submitted_id=%s lot_id=%s",
+                tray_id,
+                submitted.id,
+                submitted.lot_id,
+            )
+            continue
+
         source = 'Jig Unloading draft/model save' if submitted.is_draft else 'Jig Unloading model save'
         return _make_tray_conflict(tray_id, source, next(iter(record_lots), ''), submitted.id)
 
     draft_rows = JigUnloadDraft.objects.exclude(draft_data__isnull=True).only(
-        'draft_id', 'main_lot_id', 'combined_lot_ids', 'draft_data'
+        'draft_id', 'main_lot_id', 'model_number', 'combined_lot_ids', 'draft_data'
     )
     for draft in draft_rows.iterator():
         if not _payload_contains_tray_id(draft.draft_data, tray_variants):
@@ -472,7 +591,7 @@ def find_jig_unload_tray_conflict(raw_tray_id, allowed_lot_ids=None, include_tra
         for combined_lot_id in draft.combined_lot_ids or []:
             record_lots.update(_lot_id_aliases(combined_lot_id))
         record_lots.update(_collect_lot_aliases_from_payload(draft.draft_data))
-        if _has_allowed_lot(record_lots, allowed_aliases):
+        if _same_draft_assignment(draft, assignment_context):
             continue
         return _make_tray_conflict(
             tray_id,
@@ -482,7 +601,7 @@ def find_jig_unload_tray_conflict(raw_tray_id, allowed_lot_ids=None, include_tra
         )
 
     autosave_rows = JigUnloadAutoSave.objects.exclude(tray_data__isnull=True).only(
-        'id', 'main_lot_id', 'combined_lot_ids', 'tray_data', 'updated_at'
+        'id', 'user', 'session_key', 'main_lot_id', 'model_number', 'combined_lot_ids', 'tray_data', 'jig_id', 'updated_at'
     )
     for autosave in autosave_rows.iterator():
         if autosave.is_expired() or not autosave.has_meaningful_data():
@@ -493,7 +612,7 @@ def find_jig_unload_tray_conflict(raw_tray_id, allowed_lot_ids=None, include_tra
         for combined_lot_id in autosave.combined_lot_ids or []:
             record_lots.update(_lot_id_aliases(combined_lot_id))
         record_lots.update(_collect_lot_aliases_from_payload(autosave.tray_data))
-        if _has_allowed_lot(record_lots, allowed_aliases):
+        if _same_autosave_assignment(autosave, assignment_context):
             continue
         return _make_tray_conflict(
             tray_id,

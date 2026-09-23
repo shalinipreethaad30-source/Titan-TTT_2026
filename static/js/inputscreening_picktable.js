@@ -2134,6 +2134,14 @@ document.addEventListener("DOMContentLoaded", function () {
     const modal = document.getElementById("trayVerificationModal");
     if (!modal || modal.style.display === "none") return;
     if (document.querySelector(".swal2-container")) return;
+
+    // All application shortcuts are disabled while the event originates from
+    // an editable control. Scanner inputs keep their own Enter handler below.
+    let shortcutTarget = e.target;
+    if (shortcutTarget && shortcutTarget.nodeType === 3) shortcutTarget = shortcutTarget.parentElement;
+    if (shortcutTarget && shortcutTarget.closest &&
+        shortcutTarget.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return;
+
     if (e.ctrlKey || e.metaKey || e.altKey) return;
 
     if (e.key === "Escape" || e.key === "c" || e.key === "C") {

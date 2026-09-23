@@ -44,7 +44,7 @@
   }
   .reports-grid {
     width: 100%;
-    max-width: 1200px;
+    max-width: none;
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -242,6 +242,8 @@
     box-shadow: 0 1px 6px rgba(0,0,0,0.04);
     padding: 16px 20px;
     display: none;
+    width: 100%;
+    box-sizing: border-box;
   }
   .preview-section-header {
     display: flex;
@@ -259,14 +261,22 @@
     text-transform: uppercase;
     letter-spacing: 0.08em;
   }
-  .preview-table-inner { overflow-x: auto; }
+  .preview-table-inner {
+    max-height: 70vh;
+    overflow-x: auto;
+    overflow-y: scroll;
+  }
   .preview-table {
-    width: 100%;
+    width: max-content;
+    min-width: 100%;
     border-collapse: collapse;
     font-size: 0.82rem;
   }
   .preview-table th {
     background: #f8f9fa;
+    position: sticky;
+    top: 0;
+    z-index: 2;
     color: #6b7a8d;
     font-size: 0.68rem;
     font-weight: 700;
@@ -284,6 +294,11 @@
     vertical-align: top;
     white-space: normal;
   }
+  /* The report has many process columns. Keep each process cell wide enough
+     for labels, timestamps, and model details, then use the existing
+     horizontal scrollbar for columns beyond the viewport. */
+  .preview-table th:nth-child(n+4),
+  .preview-table td:nth-child(n+4) { min-width: 230px; }
   .preview-table tbody tr:hover { background: #fafcfc; }
   .preview-table td.stage-not_reached { background: #fdecea; }
   .preview-table td.stage-not_applicable { background: #eeeeee; }
@@ -302,10 +317,10 @@
   /* Per-cell label/value grid — readable, scannable stage detail */
   .cell-grid {
     display: grid;
-    grid-template-columns: auto 1fr;
+    grid-template-columns: max-content minmax(120px, 1fr);
     column-gap: 6px;
     row-gap: 2px;
-    min-width: 150px;
+    min-width: 220px;
     font-size: 0.78rem;
   }
   .cell-label {
@@ -467,6 +482,9 @@
                 <th>IP Inspection</th>
                 <th>Jig Unloading Z1</th>
                 <th>Jig Unloading Z2</th>
+                <th>S.No</th>
+                <th>Plating Stock No.</th>
+                <th>Lot Qty</th>
                 <th>Nickel Wiping Z1</th>
                 <th>Nickel Wiping Z2</th>
                 <th>Nickel Audit Z1</th>

@@ -200,6 +200,14 @@ document.addEventListener("DOMContentLoaded", function () {
     "Nickel Audit Z1", "Nickel Audit Z2",
     "Spider Spindle Z1", "Spider Spindle Z2",
   ];
+  var UPSTREAM_COLUMNS = [
+    "Day Planning", "Input Screening", "Brass QC", "IQF", "Brass Audit",
+    "Jig Loading", "IP Inspection", "Jig Unloading Z1", "Jig Unloading Z2",
+  ];
+  var NICKEL_COLUMNS = [
+    "Nickel Wiping Z1", "Nickel Wiping Z2", "Nickel Audit Z1", "Nickel Audit Z2",
+    "Spider Spindle Z1", "Spider Spindle Z2",
+  ];
   var MODULE_FILTER_COLUMNS = {
     "day-planning": "Day Planning",
     "input-screening": "Input Screening",
@@ -225,7 +233,7 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   function syncPreviewHeaders(columns) {
-    document.querySelectorAll(".preview-table thead th").forEach(function (header) {
+    previewWrap.querySelectorAll("thead th").forEach(function (header) {
       const name = header.textContent.trim();
       if (MODULE_COLUMNS.indexOf(name) !== -1) {
         header.style.display = columns.indexOf(name) !== -1 ? "" : "none";
@@ -233,21 +241,56 @@ document.addEventListener("DOMContentLoaded", function () {
     });
   }
 
-  function renderPreview(data) {
-    const columns = visibleModuleColumns();
-    syncPreviewHeaders(columns);
-    const previewColumnCount = 4 + columns.length; // S.No, stock, lot qty, module data, remarks
+  function appendModuleCell(tr, modules, states, details, name) {
+    const td = document.createElement("td");
+    const state = states[name];
+    if (state) td.classList.add("stage-" + state);
+    const lines = details[name];
+    if (lines && lines.length) {
+      let grid = null;
+      let currentBlock = null;
+      const splitBlocks = lines.some(function (line) { return line.block !== undefined; });
+      if (splitBlocks) td.classList.add("stage-split");
+      lines.forEach(function (line) {
+        const block = line.block === undefined ? 0 : line.block;
+        if (!grid || currentBlock !== block) {
+          grid = document.createElement("div");
+          grid.className = "cell-grid";
+          if (splitBlocks) grid.classList.add("report-stage-block", "block-" + line.block_state);
+          td.appendChild(grid);
+          currentBlock = block;
+        }
+        const labelEl = document.createElement("span");
+        labelEl.className = "cell-label";
+        labelEl.textContent = line.label;
+        const valueEl = document.createElement("span");
+        valueEl.className = "cell-value cell-value-" + (line.type || "muted");
+        valueEl.textContent = line.value;
+        grid.appendChild(labelEl);
+        grid.appendChild(valueEl);
+      });
+    } else {
+      const value = modules[name];
+      td.textContent = value === null || value === undefined ? "" : value;
+    }
+    tr.appendChild(td);
+  }
+
+  function renderReportRows(rows, columns, nickelRows) {
+    const upstreamColumns = columns.filter(function (name) { return UPSTREAM_COLUMNS.indexOf(name) !== -1; });
+    const nickelColumns = columns.filter(function (name) { return NICKEL_COLUMNS.indexOf(name) !== -1; });
+    const columnCount = 7 + upstreamColumns.length + nickelColumns.length;
     previewBody.innerHTML = "";
-    if (!data.results.length) {
+    if (!rows.length) {
       const tr = document.createElement("tr");
       const td = document.createElement("td");
-      td.colSpan = previewColumnCount;
+      td.colSpan = columnCount;
       td.style.textAlign = "center";
       td.textContent = "No records found for the selected filters.";
       tr.appendChild(td);
       previewBody.appendChild(tr);
     } else {
-      data.results.forEach(function (row) {
+      rows.forEach(function (row, index) {
         const tr = document.createElement("tr");
         const modules = row.modules || {};
         const moduleStates = row.module_states || {};
@@ -258,40 +301,17 @@ document.addEventListener("DOMContentLoaded", function () {
           tr.appendChild(td);
         });
         const moduleDetails = row.module_details || {};
-        columns.forEach(function (name) {
+        upstreamColumns.forEach(function (name) {
+          appendModuleCell(tr, modules, moduleStates, moduleDetails, name);
+        });
+        const nickel = (nickelRows || [])[index] || {};
+        [nickel.s_no, nickel.plating_stk_no, nickel.lot_qty].forEach(function (value) {
           const td = document.createElement("td");
-          const state = moduleStates[name];
-          if (state) td.classList.add("stage-" + state);
-
-          const lines = moduleDetails[name];
-          if (lines && lines.length) {
-            let grid = null;
-            let currentBlock = null;
-            const splitBlocks = lines.some(function (line) { return line.block !== undefined; });
-            if (splitBlocks) td.classList.add("stage-split");
-            lines.forEach(function (line) {
-              const block = line.block === undefined ? 0 : line.block;
-              if (!grid || currentBlock !== block) {
-                grid = document.createElement("div");
-                grid.className = "cell-grid";
-                if (splitBlocks) grid.classList.add("report-stage-block", "block-" + line.block_state);
-                td.appendChild(grid);
-                currentBlock = block;
-              }
-              const labelEl = document.createElement("span");
-              labelEl.className = "cell-label";
-              labelEl.textContent = line.label;
-              const valueEl = document.createElement("span");
-              valueEl.className = "cell-value cell-value-" + (line.type || "muted");
-              valueEl.textContent = line.value;
-              grid.appendChild(labelEl);
-              grid.appendChild(valueEl);
-            });
-          } else {
-            const value = modules[name];
-            td.textContent = value === null || value === undefined ? "" : value;
-          }
+          td.textContent = value === null || value === undefined ? "" : value;
           tr.appendChild(td);
+        });
+        nickelColumns.forEach(function (name) {
+          appendModuleCell(tr, nickel.modules || {}, nickel.module_states || {}, nickel.module_details || {}, name);
         });
         const remarksTd = document.createElement("td");
         remarksTd.textContent = row.remarks === null || row.remarks === undefined ? "" : row.remarks;
@@ -299,14 +319,20 @@ document.addEventListener("DOMContentLoaded", function () {
         previewBody.appendChild(tr);
       });
     }
+  }
+
+  function renderPreview(data) {
+    const columns = visibleModuleColumns();
+    syncPreviewHeaders(columns);
+    renderReportRows(data.results, columns, data.nickel_results || []);
+    previewWrap.style.display = "block";
+
     pageInfo.textContent =
       "Page " + data.page + " of " + data.num_pages +
       " (" + data.total_records + " records)";
     prevBtn.disabled = !data.has_previous;
     nextBtn.disabled = !data.has_next;
-    previewWrap.style.display = "block";
     currentPage = data.page;
-    // Scroll the preview into view (it lives inside a scrollable container)
     previewWrap.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 

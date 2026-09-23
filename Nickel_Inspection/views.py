@@ -398,6 +398,37 @@ def _nq_get_original_trays_for_allocation(lot_id, juat, create_missing=False):
         for index, tray in enumerate(raw_trays)
     ]
 
+
+def _nq_normalize_full_reject_event_trays(orig_trays, rejected_qty, total_qty):
+    """Validate and snapshot the active original trays for a full rejection."""
+    if rejected_qty != total_qty:
+        raise ValueError('Full reject quantity must equal total lot quantity')
+    if not orig_trays:
+        raise ValueError('Full reject requires active original trays')
+
+    snapshot = []
+    seen_tray_ids = set()
+    for tray in orig_trays:
+        tray_id = str((tray or {}).get('tray_id') or '').strip().upper()
+        try:
+            qty = int((tray or {}).get('qty') or 0)
+        except (TypeError, ValueError):
+            qty = 0
+
+        if not tray_id:
+            raise ValueError('Full reject original tray ID is required')
+        if tray_id in seen_tray_ids:
+            raise ValueError(f'Duplicate original tray ID {tray_id}')
+        if qty <= 0:
+            raise ValueError(f'Original tray {tray_id} must have a positive quantity')
+
+        seen_tray_ids.add(tray_id)
+        snapshot.append({'tray_id': tray_id, 'qty': qty})
+
+    if tray_qty_total(snapshot) != rejected_qty:
+        raise ValueError('Full reject original tray total does not match rejected qty')
+    return snapshot
+
 def _get_input_source(jig_unload_obj):
     """Return location names with fallback chain: M2M → TotalStockModel → TrayId → ModelMasterCreation."""
     names = [loc.location_name for loc in jig_unload_obj.location.all()]
@@ -1428,6 +1459,7 @@ def _nq_do_submit_reject(request, lot_id, juat):
     )
     orig_cap = _nq_tray_capacity(juat.tray_type or '') or juat.tray_capacity or 20
     orig_trays = _nq_get_original_trays_for_allocation(lot_id, juat, create_missing=True)
+    event_reject_trays = reject_trays
 
     if is_partial:
         # Partial rejection still uses the existing tray allocation workflow.
@@ -1470,6 +1502,7 @@ def _nq_do_submit_reject(request, lot_id, juat):
             validate_original_tray_coverage(
                 accept_trays, delink_trays_snapshot, orig_trays, reject_trays=reject_trays,
             )
+            event_reject_trays = reject_trays
         except ValueError as exc:
             return Response({'success': False, 'error': str(exc)}, status=400)
 
@@ -1489,10 +1522,14 @@ def _nq_do_submit_reject(request, lot_id, juat):
         if tray_qty_total(accept_trays) != accepted_qty:
             return Response({'success': False, 'error': 'Accept tray total does not match accepted qty'}, status=400)
     else:
-        # Full-lot rejection is a lot-level rejection. The operator must not be
-        # asked to allocate/scan Reject, Delink, or Accept trays. Keep the
-        # existing original trays attached to the lot and persist an empty tray
-        # allocation snapshot for this rejection event.
+        # Full reject records the active original trays as this event's reject
+        # identity. They remain occupied until Delink Selected is performed.
+        try:
+            event_reject_trays = _nq_normalize_full_reject_event_trays(
+                orig_trays, rejected_qty, total_qty,
+            )
+        except ValueError as exc:
+            return Response({'success': False, 'error': str(exc)}, status=400)
         reject_trays = []
         accept_trays = []
         delink_trays_snapshot = []
@@ -1501,7 +1538,7 @@ def _nq_do_submit_reject(request, lot_id, juat):
         delink_ids = set()
         accept_ids = set()
 
-    for rt in reject_trays:
+    for rt in reject_trays if is_partial else []:
         tid = (rt.get('tray_id') or '').upper()
         series_valid, series_message, _ = validate_nickel_wiping_rejection_tray_series(
             tid,
@@ -1551,7 +1588,7 @@ def _nq_do_submit_reject(request, lot_id, juat):
         )
         reason_store.rejection_reason.set(reasons_qs)
         # Save each reject tray scan
-        for rt in reject_trays:
+        for rt in reject_trays if is_partial else []:
             tid = rt.get('tray_id', '').strip()
             qty = int(rt.get('qty', 0))
             if not tid or qty <= 0:
@@ -1652,7 +1689,7 @@ def _nq_do_submit_reject(request, lot_id, juat):
             accepted_qty=accepted_qty,
             rejected_qty=rejected_qty,
             accept_trays_data=accept_trays,
-            reject_trays_data=reject_trays,
+            reject_trays_data=event_reject_trays,
             created_by=request.user,
         )
         # ── For partial: create child JigUnloadAfterTable row (accepted portion) ──
@@ -1743,7 +1780,7 @@ def _nq_do_submit_reject(request, lot_id, juat):
                 record_lot_id=_nw_generate_record_id('NWFR', NickelWiping_FullRejectRecord),
                 total_qty=total_qty,
                 rejected_qty=rejected_qty,
-                reject_trays=reject_trays,
+                reject_trays=event_reject_trays,
                 delink_trays=delink_trays_snapshot,
                 reject_reasons=reason_data,
                 remarks=remarks,

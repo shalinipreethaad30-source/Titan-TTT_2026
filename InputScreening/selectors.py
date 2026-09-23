@@ -113,6 +113,14 @@ def pick_table_queryset() -> QuerySet:
         )
     )
     
+    submitted_batches = Exists(
+        InputScreening_Submitted.objects.filter(
+            batch_id=OuterRef("batch_id"),
+            is_active=True,
+            is_submitted=True,
+        )
+    )
+
     # Check if this lot has an active reject-modal draft (saved via Save Draft button)
     from .models import IP_Rejection_Draft
     has_draft = Exists(
@@ -156,6 +164,7 @@ def pick_table_queryset() -> QuerySet:
             ip_release_reason=_latest("ip_release_reason"),
             remove_lot=_latest("remove_lot"),
             submitted=submitted_lots,
+            submitted_by_batch=submitted_batches,
             has_draft=has_draft,  # ✅ Indicate if lot has active draft
         )
         .filter(tray_scan_exists=True, Moved_to_D_Picker=True)
@@ -163,8 +172,10 @@ def pick_table_queryset() -> QuerySet:
             Q(accepted_Ip_stock=True)
             | Q(accepted_tray_scan_status=True)
             | Q(rejected_ip_stock=True)
+            | Q(few_cases_accepted_Ip_stock=True)
             | Q(remove_lot=True)
             | Q(submitted=True)  # ERR3: Exclude submitted lots
+            | Q(submitted_by_batch=True)
             | Q(last_process_module='Jig Loading (Excess)')  # Exclude Jig Loading (Excess) lots
         )
         .order_by("-created_at")

@@ -1,5 +1,6 @@
 from django.contrib.auth.models import User
 from django.test import TestCase
+from rest_framework.test import APIRequestFactory, force_authenticate
 
 from Jig_Unloading.models import JigUnloadAfterTable
 from modelmasterapp.models import TrayId
@@ -7,12 +8,144 @@ from Nickel_Inspection.models import (
     Nickel_QC_Draft_Store,
     Nickel_QC_Rejected_TrayScan,
     Nickel_QC_Rejection_Table,
+    NickelQC_Submission,
+    NickelQcTrayId,
+    NickelWiping_FullRejectRecord,
 )
 from Nickel_Inspection.services import (
+    get_current_nickel_wiping_reject_trays,
     get_nickel_wiping_rejection_tray_allocation,
+    has_unreleased_nickel_wiping_reject_trays,
     validate_nickel_wiping_rejection_tray_available,
     validate_nickel_wiping_rejection_tray_series,
 )
+from Nickel_Inspection.views import (
+    _nq_normalize_full_reject_event_trays,
+    nq_action,
+    nq_delink_selected_trays,
+)
+
+
+class NickelWipingFullRejectLifecycleTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='full-reject-user')
+        self.factory = APIRequestFactory()
+        self.lot_id = 'UNLOT-FULL-REJECT-288'
+        self.juat = JigUnloadAfterTable.objects.create(
+            jig_qr_id='JIG-FULL-REJECT',
+            lot_id=self.lot_id,
+            total_case_qty=288,
+            tray_type='Jumbo',
+            tray_capacity=12,
+            current_stage='Nickel Wiping',
+        )
+        self.tray_ids = [f'JL-A{i:05d}' for i in range(201, 225)]
+        for index, tray_id in enumerate(self.tray_ids):
+            NickelQcTrayId.objects.create(
+                lot_id=self.lot_id,
+                tray_id=tray_id,
+                tray_quantity=12,
+                top_tray=index == 0,
+                tray_type='Jumbo',
+                tray_capacity=12,
+            )
+            TrayId.objects.create(
+                tray_id=tray_id,
+                lot_id=self.lot_id,
+                tray_quantity=12,
+                scanned=True,
+            )
+
+    def _submit_full_reject(self):
+        request = self.factory.post('/nickle_inspection/api/action/', {
+            'action': 'SUBMIT_REJECT',
+            'lot_id': self.lot_id,
+            'full_lot_rejection': True,
+            'rejected_qty': 288,
+            'remarks': 'Full lot rejected during Nickel Wiping',
+            'reject_trays': [],
+            'accept_trays': [],
+            'delink_trays': [],
+        }, format='json')
+        force_authenticate(request, user=self.user)
+        return nq_action(request)
+
+    def test_full_reject_snapshot_and_delink_lifecycle(self):
+        response = self._submit_full_reject()
+        self.assertEqual(200, response.status_code)
+
+        submission = NickelQC_Submission.objects.get(lot_id=self.lot_id)
+        full_record = NickelWiping_FullRejectRecord.objects.get(source_lot_id=self.lot_id)
+        expected = [{'tray_id': tray_id, 'qty': 12} for tray_id in self.tray_ids]
+        self.assertEqual('FULL_REJECT', submission.submission_type)
+        self.assertEqual(expected, submission.reject_trays_data)
+        self.assertEqual(expected, full_record.reject_trays)
+        self.assertEqual(24, len(submission.reject_trays_data))
+        self.assertEqual(288, sum(row['qty'] for row in submission.reject_trays_data))
+        self.assertEqual(expected, get_current_nickel_wiping_reject_trays(self.lot_id))
+        self.assertTrue(has_unreleased_nickel_wiping_reject_trays(self.lot_id))
+        self.assertFalse(
+            NickelQcTrayId.objects.filter(lot_id=self.lot_id, delink_tray=True).exists()
+        )
+        self.assertEqual(
+            24,
+            TrayId.objects.filter(tray_id__in=self.tray_ids, lot_id=self.lot_id).count(),
+        )
+
+        request = self.factory.post('/nickle_inspection/nickel_qc_delink_selected_trays/', {
+            'stock_lot_ids': [self.lot_id],
+        }, format='json')
+        force_authenticate(request, user=self.user)
+        response = nq_delink_selected_trays(request)
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(24, response.data['updated'])
+        self.assertFalse(has_unreleased_nickel_wiping_reject_trays(self.lot_id))
+        self.assertEqual(
+            24,
+            NickelQcTrayId.objects.filter(
+                lot_id=self.lot_id,
+                rejected_tray=True,
+                delink_tray=True,
+                tray_quantity=0,
+                delink_tray_qty='12',
+            ).count(),
+        )
+
+        repeat_request = self.factory.post('/nickle_inspection/nickel_qc_delink_selected_trays/', {
+            'stock_lot_ids': [self.lot_id],
+        }, format='json')
+        force_authenticate(repeat_request, user=self.user)
+        repeat_response = nq_delink_selected_trays(repeat_request)
+        self.assertEqual(200, repeat_response.status_code)
+        self.assertEqual(0, repeat_response.data['updated'])
+
+    def test_full_reject_incomplete_coverage_fails_without_rejection_state(self):
+        NickelQcTrayId.objects.filter(
+            lot_id=self.lot_id,
+            tray_id=self.tray_ids[-1],
+        ).update(tray_quantity=0)
+
+        response = self._submit_full_reject()
+
+        self.assertEqual(400, response.status_code)
+        self.assertFalse(NickelQC_Submission.objects.filter(lot_id=self.lot_id).exists())
+        self.assertFalse(
+            NickelWiping_FullRejectRecord.objects.filter(source_lot_id=self.lot_id).exists()
+        )
+        self.juat.refresh_from_db()
+        self.assertFalse(self.juat.nq_qc_rejection)
+
+    def test_full_reject_snapshot_validation_rejects_duplicates_and_zero_qty(self):
+        with self.assertRaisesMessage(ValueError, 'Duplicate original tray ID'):
+            _nq_normalize_full_reject_event_trays([
+                {'tray_id': 'JL-A00201', 'qty': 6},
+                {'tray_id': 'jl-a00201', 'qty': 6},
+            ], 12, 12)
+
+        with self.assertRaisesMessage(ValueError, 'positive quantity'):
+            _nq_normalize_full_reject_event_trays([
+                {'tray_id': 'JL-A00201', 'qty': 0},
+            ], 12, 12)
 
 
 class NickelWipingRejectionTrayAvailabilityTests(TestCase):

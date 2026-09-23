@@ -1719,26 +1719,88 @@ class JU_Zone_MainTable(LoginRequiredMixin, TemplateView):
             # Process model_cases using THE SAME batch_ids from lot_ids (CORRECTED LOGIC)
             model_cases_data = self.process_model_cases_corrected(jig_detail.no_of_model_cases, multiple_lot_ids)
             
-            # Extract lot_id_quantities - CORRECTED PRIORITY ORDER
+            # Extract quantities for the main table and Add Model separately.
+            # Main-table Lot Qty keeps the existing single total display.
+            # Add Model receives a separate per-lot allocation map so its preview
+            # can total only the lots that belong to the selected model.
             draft_data = getattr(jig_detail, 'draft_data', {}) or {}
-            
-            # ✅ FIX err 4: Use JigCompleted fields (Jig Loading's updated qty) as primary source
-            # Priority: JigCompleted.updated_lot_qty (set by Jig Loading) → loaded_cases_qty → draft_data
+
+            _allocation_quantities = {}
+            _allocation_model_map = {}
+            _multi_alloc = getattr(jig_detail, 'multi_model_allocation', None) or []
+            if isinstance(_multi_alloc, str):
+                try:
+                    _multi_alloc = json.loads(_multi_alloc)
+                except Exception:
+                    _multi_alloc = []
+
+            if isinstance(_multi_alloc, list):
+                for _allocation in _multi_alloc:
+                    if not isinstance(_allocation, dict):
+                        continue
+
+                    _lot_id = str(
+                        _allocation.get('lot_id')
+                        or _allocation.get('source_lot_id')
+                        or _allocation.get('combined_lot_id')
+                        or ''
+                    ).strip()
+                    if not _lot_id:
+                        continue
+
+                    try:
+                        _qty = int(
+                            _allocation.get('allocated_qty')
+                            or _allocation.get('qty')
+                            or _allocation.get('quantity')
+                            or 0
+                        )
+                    except (TypeError, ValueError):
+                        _qty = 0
+
+                    if _qty > 0:
+                        _allocation_quantities[_lot_id] = _qty
+
+                    _model_no = str(
+                        _allocation.get('model_name')
+                        or _allocation.get('plating_stk_no')
+                        or _allocation.get('model')
+                        or _allocation.get('model_no')
+                        or ''
+                    ).strip()
+                    if _model_no:
+                        _allocation_model_map[_lot_id] = _model_no
+
+            # Separate data used only by the Add Model candidate preview.
+            jig_detail.add_model_lot_quantities = _allocation_quantities.copy()
+            jig_detail.add_model_lot_model_map = _allocation_model_map.copy()
+
+            # Preserve the original main-table quantity behavior: one total number.
             if jig_detail.updated_lot_qty and jig_detail.updated_lot_qty > 0:
-                # Use Jig Loading's updated qty (respects jig capacity constraints)
-                jig_detail.lot_id_quantities = {jig_detail.lot_id: jig_detail.updated_lot_qty}
-                print(f"   📦 Using JigCompleted.updated_lot_qty: {jig_detail.updated_lot_qty} (Jig Loading qty)")
+                _display_qty = jig_detail.updated_lot_qty
+                print(f"   📦 Main-table qty from updated_lot_qty: {_display_qty}")
             elif jig_detail.loaded_cases_qty and jig_detail.loaded_cases_qty > 0:
-                # Fallback to loaded_cases_qty
-                jig_detail.lot_id_quantities = {jig_detail.lot_id: jig_detail.loaded_cases_qty}
-                print(f"   📦 Using JigCompleted.loaded_cases_qty: {jig_detail.loaded_cases_qty}")
+                _display_qty = jig_detail.loaded_cases_qty
+                print(f"   📦 Main-table qty from loaded_cases_qty: {_display_qty}")
+            elif _allocation_quantities:
+                _display_qty = sum(_allocation_quantities.values())
+                print(f"   📦 Main-table qty from allocation total: {_display_qty}")
             else:
-                # Final fallback to draft_data or original_lot_qty
-                jig_detail.lot_id_quantities = draft_data.get('lot_id_quantities', {jig_detail.lot_id: jig_detail.original_lot_qty or 0})
-                print(f"   📦 Using draft_data lot_id_quantities: {jig_detail.lot_id_quantities}")
-            
-            jig_detail.lot_id_list = list(jig_detail.lot_id_quantities.keys())
-            
+                _draft_quantities = draft_data.get('lot_id_quantities') or {}
+                try:
+                    _display_qty = sum(int(v or 0) for v in _draft_quantities.values())
+                except Exception:
+                    _display_qty = jig_detail.original_lot_qty or 0
+                print(f"   📦 Main-table qty from legacy fallback: {_display_qty}")
+
+            jig_detail.lot_id_quantities = {jig_detail.lot_id: _display_qty}
+            jig_detail.lot_id_list = [jig_detail.lot_id] if jig_detail.lot_id else []
+
+            # If there is no allocation map (legacy/single-lot record), Add Model
+            # can safely use the same total quantity and existing model map.
+            if not jig_detail.add_model_lot_quantities and jig_detail.lot_id:
+                jig_detail.add_model_lot_quantities = {jig_detail.lot_id: _display_qty}
+
             # Create enhanced jig_detail with multi-lot support
             enhanced_jig_detail = self.create_enhanced_jig_detail(jig_detail, lot_ids_data, model_cases_data)
             
@@ -2170,77 +2232,141 @@ class JU_Zone_MainTable(LoginRequiredMixin, TemplateView):
 
         # Filter jigs
         filtered_jigs = []
+
         for jig in queryset:
-            # ✅ SECONDARY LOT CHECK: hide lots that are secondary models in a
-            # multi-model Jig Loading submission (already shown inside primary row).
-            if jig.lot_id in secondary_lot_ids:
-                print(f"🚫 [ZONE2 SECONDARY LOT FILTER] Hiding secondary multi-model lot: {jig.lot_id}")
+
+            # ---------------------------------------------------------------
+            # PICK TABLE COMPLETED JIG FILTER
+            # ---------------------------------------------------------------
+            # A JigCompleted record that has already reached Jig Unloading
+            # is completed and must not remain in the Zone 2 Pick Table.
+            # Display-only filter: no database records are modified.
+            if getattr(jig, 'last_process_module', None) == 'Jig Unloading':
+                print(
+                    f"🚫 [ZONE2 PICK FILTER] Removing completed jig from Pick Table: "
+                    f"id={getattr(jig, 'id', None)}, "
+                    f"jig_id={getattr(jig, 'jig_id', '')}, "
+                    f"lot_id={getattr(jig, 'lot_id', '')}"
+                )
                 continue
 
+            # ---------------------------------------------------------------
+            # SECONDARY MULTI-MODEL LOT
+            # ---------------------------------------------------------------
+            # Secondary lots are already represented inside the primary
+            # multi-model JigCompleted row.
+            if jig.lot_id in secondary_lot_ids:
+                print(
+                    f"🚫 [ZONE2 SECONDARY LOT FILTER] "
+                    f"Hiding secondary multi-model lot: {jig.lot_id}"
+                )
+                continue
+
+            # ---------------------------------------------------------------
+            # GET ALL LOT IDs REPRESENTED BY THIS JIG
+            # ---------------------------------------------------------------
             _jfq = self._get_zone2_jig_lot_quantities(jig)
+
             if not _jfq:
-                # Fallback to base lot_id if lot_id_quantities isn't present in draft_data
                 if getattr(jig, 'lot_id', None):
-                    _jfq = {jig.lot_id: getattr(jig, 'updated_lot_qty', 1)}
+                    _jfq = {
+                        jig.lot_id: getattr(jig, 'updated_lot_qty', 1)
+                    }
                 else:
-                    # Truly no lot data — keep the jig visible
+                    # No lot information -> keep visible
                     filtered_jigs.append(jig)
                     continue
 
             jig_lot_ids = set(_jfq.keys())
 
-            # ✅ FAST PATH: single-model jigs can be hidden by their completion flag.
-            # Multi-model jigs must stay visible until every model lot_id is submitted.
-            # Scoped to this record's own lot_id — jig hardware IDs (jig_id) are reused
-            # across lots/cycles, so matching on jig_id alone would hide a brand-new
-            # pending lot just because an unrelated earlier lot shared the same jig.
-            if len(jig_lot_ids) <= 1 and jig.lot_id in completed_lot_ids:
-                print(f"🚫 [ZONE2 FAST PATH] Hiding completed single-model jig: {jig.lot_id}")
-                continue
-
-            if jig_lot_ids and jig_lot_ids.issubset(completed_lot_ids):
-                print(f"🚫 [ZONE2 FAST PATH] Hiding - all lot_ids unloaded: {jig.lot_id}")
-                continue
-
-            # IMPORTANT: the row is already past the final-completion checks.
-            # If an unload draft belongs to this JigCompleted (or to one of the
-            # lot_ids represented by this row), keep the row visible so the user
-            # can resume it.  This does NOT change is_already_loaded_z1,
-            # is_merged_additional, Add Model, or any final-submission behavior.
+            # ---------------------------------------------------------------
+            # ACTIVE DRAFT
+            # ---------------------------------------------------------------
+            # Draft rows must remain visible so the user can resume them.
             has_active_draft = (
                 getattr(jig, 'id', None) in draft_jig_completed_ids
                 or bool(jig_lot_ids & draft_lot_ids)
             )
+
             if has_active_draft:
                 print(
-                    f"✅ [ZONE2 DRAFT VISIBILITY] Keeping jig visible for active draft: "
-                    f"jig_id={getattr(jig, 'jig_id', '')}, lot_ids={sorted(jig_lot_ids)}"
+                    f"✅ [ZONE2 DRAFT VISIBILITY] Keeping active draft: "
+                    f"jig_id={getattr(jig, 'jig_id', '')}, "
+                    f"lot_ids={sorted(jig_lot_ids)}"
                 )
                 filtered_jigs.append(jig)
                 continue
 
-            # Fallback: use only records that represent an actual/final unload.
-            # A JUSubmittedZ1 record with is_draft=False is the model-level
-            # "Save & Back" state used by the working Zone 1 flow.  It must NOT
-            # by itself remove the JIG from the Zone 2 pick table.  The JIG is
-            # hidden only when the final-completion state is reached
-            # (last_process_module='Jig Unloading') or an actual unload record
-            # exists in JigUnloadAfterTable/JigUnload_TrayId.
+            # ---------------------------------------------------------------
+            # COMPLETED / UNLOADED CHECK
+            # ---------------------------------------------------------------
             #
-            # This is intentionally NOT an Already Loaded change.
-            # is_merged_additional / is_already_loaded_z1 remain untouched.
-            unloaded_lot_ids = (
-                unload_map.get(jig.jig_id, set())
+            # IMPORTANT:
+            # Do not rely only on jig.lot_id for multi-model jigs.
+            #
+            # If the primary JigCompleted record itself is already marked
+            # "Jig Unloading", it is completed and must not appear in the
+            # Pick Table.
+            #
+            # For multi-model records, check every lot represented by the row.
+            # A lot is considered completed if it is present in either:
+            #
+            #   1. JigCompleted.last_process_module = 'Jig Unloading'
+            #   2. an actual/final unload record
+            #
+            # This is DISPLAY/FILTER ONLY.
+            # No database records are changed.
+            # ---------------------------------------------------------------
+
+            completed_lots_for_jig = jig_lot_ids & completed_lot_ids
+
+            unloaded_lots_for_jig = (
+                unload_map.get(getattr(jig, 'jig_id', None), set())
                 | (jig_lot_ids & bare_unloaded_lot_ids)
             )
-            
-            # Keep jig if ANY lot_id is NOT unloaded
-            if not jig_lot_ids.issubset(unloaded_lot_ids):
-                filtered_jigs.append(jig)
-            else:
-                print(f"🚫 [ZONE2 MAP PATH] Hiding fully unloaded jig: {jig.jig_id}")
-        
+
+            completed_or_unloaded_lots = (
+                completed_lots_for_jig
+                | unloaded_lots_for_jig
+            )
+
+            # ---------------------------------------------------------------
+            # SINGLE-MODEL COMPLETED / UNLOADED
+            # ---------------------------------------------------------------
+            if len(jig_lot_ids) <= 1 and completed_or_unloaded_lots:
+                print(
+                    f"🚫 [ZONE2 PICK FILTER] Hiding completed/unloaded jig: "
+                    f"jig_id={getattr(jig, 'jig_id', '')}, "
+                    f"lot_ids={sorted(jig_lot_ids)}, "
+                    f"completed={sorted(completed_lots_for_jig)}, "
+                    f"unloaded={sorted(unloaded_lots_for_jig)}"
+                )
+                continue
+
+            # ---------------------------------------------------------------
+            # MULTI-MODEL: HIDE ONLY WHEN ALL REPRESENTED LOTS ARE COMPLETE
+            # ---------------------------------------------------------------
+            if (
+                jig_lot_ids
+                and jig_lot_ids.issubset(completed_or_unloaded_lots)
+            ):
+                print(
+                    f"🚫 [ZONE2 PICK FILTER] Hiding fully completed/unloaded "
+                    f"multi-model jig: "
+                    f"jig_id={getattr(jig, 'jig_id', '')}, "
+                    f"lot_ids={sorted(jig_lot_ids)}, "
+                    f"completed={sorted(completed_lots_for_jig)}, "
+                    f"unloaded={sorted(unloaded_lots_for_jig)}"
+                )
+                continue
+
+            # ---------------------------------------------------------------
+            # STILL PENDING
+            # ---------------------------------------------------------------
+            filtered_jigs.append(jig)
+
         return filtered_jigs
+
 
     def check_draft_status_for_jigs(self, jig_queryset):
         """Check if any jig has draft records based on main_lot_id in new_lot_ids or lot_id_quantities"""
@@ -2925,6 +3051,8 @@ def JU_Zone_save_jig_unload_tray_ids(request):
         combined_lot_ids = data.get('combined_lot_ids', [])
         main_lot_id = data.get('main_lot_id', '')
         jig_lot_id = data.get('jig_lot_id', '')
+        model_no = str(data.get('model_no') or data.get('model_number') or '').strip()
+        jig_completed_id = data.get('jig_completed_id')
         
         # 🔧 NEW: Get jig-aware sources from frontend
         jig_aware_sources = data.get('jig_aware_sources', [])
@@ -2969,6 +3097,15 @@ def JU_Zone_save_jig_unload_tray_ids(request):
                 tray_id,
                 allowed_lot_ids=allowed_lot_ids_for_trays,
                 include_tray_master=True,
+                current_assignment={
+                    'jig_completed_id': jig_completed_id,
+                    'lot_id': main_lot_id or jig_lot_id,
+                    'main_lot_id': main_lot_id,
+                    'model_no': model_no,
+                    'combined_lot_ids': combined_lot_ids,
+                    'user_id': request.user.id if request.user.is_authenticated else None,
+                    'session_key': getattr(request.session, 'session_key', None),
+                },
             )
             if tray_conflict:
                 return JsonResponse({
@@ -3806,6 +3943,13 @@ def JU_Zone_save_jig_unload_draft(request):
                 tray_id,
                 allowed_lot_ids=allowed_lot_ids_for_trays,
                 include_tray_master=True,
+                current_assignment={
+                    'main_lot_id': main_lot_id,
+                    'model_number': model_number,
+                    'combined_lot_ids': combined_lot_ids,
+                    'user_id': request.user.id if request.user.is_authenticated else None,
+                    'session_key': getattr(request.session, 'session_key', None),
+                },
             )
             if tray_conflict:
                 return JsonResponse({
@@ -3989,6 +4133,9 @@ def JU_Zone_validate_tray_id(request):
     data = json.loads(request.body)
     tray_id = normalize_jig_unload_tray_id(data.get('tray_id', ''))
     lot_id = data.get('lot_id', '').strip()
+    model_no = str(data.get('model_no') or data.get('model_number') or '').strip()
+    jig_completed_id = data.get('jig_completed_id')
+    jig_id = str(data.get('jig_id') or '').strip()
 
     print(f"[DEBUG] JU_Zone_validate_tray_id called with tray_id: '{tray_id}', lot_id: '{lot_id}'")
 
@@ -4006,6 +4153,14 @@ def JU_Zone_validate_tray_id(request):
         tray_id,
         allowed_lot_ids=allowed_lot_ids_for_trays,
         include_tray_master=True,
+        current_assignment={
+            'jig_completed_id': jig_completed_id,
+            'lot_id': lot_id,
+            'model_no': model_no,
+            'jig_id': jig_id,
+            'user_id': request.user.id if request.user.is_authenticated else None,
+            'session_key': getattr(request.session, 'session_key', None),
+        },
     )
     if tray_conflict:
         return JsonResponse({
@@ -4090,7 +4245,9 @@ def JU_Zone_validate_tray_id(request):
             print(f"[DEBUG] ✅ Tray available: delinked and reusable")
             return JsonResponse({'success': True, 'message': 'Tray available - delinked'})
         elif lot_id:
-            # For Jig Unloading: tray assigned to the current lot being unloaded is VALID
+            # Lot membership alone is not tray ownership. Active Jig Unloading
+            # ownership has already been checked assignment-aware above; this
+            # branch only preserves the existing upstream current-lot eligibility.
             lot_ids_to_check = [lid.strip() for lid in lot_id.split(',')] if ',' in lot_id else [lot_id.strip()]
             tray_lot_str = str(tray.lot_id).strip()
             if tray_lot_str in lot_ids_to_check:
@@ -4132,6 +4289,9 @@ def JU_Zone_validate_tray_id_dynamic(request):
         tray_id = normalize_jig_unload_tray_id(data.get('tray_id', ''))
         lot_id = data.get('lot_id', '').strip()
         plating_color = data.get('plating_color', '').strip()
+        model_no = str(data.get('model_no') or data.get('model_number') or '').strip()
+        jig_completed_id = data.get('jig_completed_id')
+        jig_id = str(data.get('jig_id') or '').strip()
 
         print(f"[DEBUG] JU_Zone_validate_tray_id_dynamic Zone 2 called with tray_id: '{tray_id}', lot_id: '{lot_id}', plating_color: '{plating_color}'")
 
@@ -4339,6 +4499,14 @@ def JU_Zone_validate_tray_id_dynamic(request):
             tray_id,
             allowed_lot_ids=allowed_lot_ids_for_trays,
             include_tray_master=True,
+            current_assignment={
+                'jig_completed_id': jig_completed_id,
+                'lot_id': lot_id,
+                'model_no': model_no,
+                'jig_id': jig_id,
+                'user_id': request.user.id if request.user.is_authenticated else None,
+                'session_key': getattr(request.session, 'session_key', None),
+            },
         )
         if tray_conflict:
             return JsonResponse({
@@ -4418,18 +4586,18 @@ def JU_Zone_validate_tray_id_dynamic(request):
 
             if derived_tray_type:
                 dt_norm = str(derived_tray_type).strip().lower()
-                if dt_norm == 'jumbo' and not tray_id.startswith('JD-'):
+                if dt_norm == 'jumbo' and not tray_id.startswith(('JD-', 'JL-')):
                     return JsonResponse({
                         'success': False,
                         'error': f'Tray {tray_id} prefix mismatch for tray type Jumbo',
-                        'message': f'❌ {tray_id} - Tray Type is Jumbo. Expected prefix: JR- (e.g. JR-A00001)',
+                        'message': f'❌ {tray_id} - Tray Type is Jumbo. Expected prefix: JD- or JL- (e.g. JD-A00001 / JL-A00001)',
                         'validation_type': 'invalid_prefix_for_tray_type'
                     }, status=400)
-                if dt_norm == 'normal' and not tray_id.startswith('ND-'):
+                if dt_norm == 'normal' and not tray_id.startswith(('ND-', 'NL-')):
                     return JsonResponse({
                         'success': False,
                         'error': f'Tray {tray_id} prefix mismatch for tray type Normal',
-                        'message': f'❌ {tray_id} - Tray Type is Normal. Expected prefix: NR- (e.g. NR-A00001)',
+                        'message': f'❌ {tray_id} - Tray Type is Normal. Expected prefix: ND- or NL- (e.g. ND-A00001 / NL-A00001)',
                         'validation_type': 'invalid_prefix_for_tray_type'
                     }, status=400)
 
@@ -6228,6 +6396,14 @@ def JU_Zone_autosave_jig_unload(request):
 
             tray_data = data.get('tray_data', [])
             allowed_lot_ids_for_trays = [main_lot_id] + list(data.get('combined_lot_ids', []) or [])
+            autosave_assignment = {
+                'main_lot_id': main_lot_id,
+                'model_number': data.get('model_number', ''),
+                'combined_lot_ids': data.get('combined_lot_ids', []),
+                'jig_id': data.get('jig_id', ''),
+                'user_id': request.user.id if request.user.is_authenticated else None,
+                'session_key': request.session.session_key,
+            }
             seen_tray_ids = set()
             for i, tray in enumerate(tray_data):
                 if not isinstance(tray, dict):
@@ -6248,6 +6424,7 @@ def JU_Zone_autosave_jig_unload(request):
                     tray_id,
                     allowed_lot_ids=allowed_lot_ids_for_trays,
                     include_tray_master=True,
+                    current_assignment=autosave_assignment,
                 )
                 if tray_conflict:
                     return JsonResponse({

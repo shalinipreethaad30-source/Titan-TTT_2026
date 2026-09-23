@@ -119,7 +119,7 @@ STATE_NOT_APPLICABLE = 'not_applicable'
 STATE_CURRENT = 'current'
 STATE_COMPLETED = 'completed'
 
-_CURRENT_STAGE_STATUSES = {'In Progress', 'Pending'}
+_CURRENT_STAGE_STATUSES = {'In Progress', 'Pending', 'Yet to be Loaded'}
 
 
 def _stage_state(status):
@@ -151,6 +151,21 @@ def _normalize_unload_lot_id(value):
     return value
 
 
+def _combined_remarks(*values):
+    """Return every distinct stage remark, retaining its source module."""
+    remarks = []
+    seen = set()
+    for stage, value in values:
+        text = str(value or '').strip()
+        if not text:
+            continue
+        rendered = f'{stage}: {text}' if stage else text
+        if rendered not in seen:
+            seen.add(rendered)
+            remarks.append(rendered)
+    return '\n'.join(remarks)
+
+
 def _first_remark(*values):
     for value in values:
         if value and str(value).strip():
@@ -159,7 +174,8 @@ def _first_remark(*values):
 
 
 def _module_cell(status, in_time=None, out_time=None, lot_qty=None, accepted_qty=None,
-                  rejected_qty=None, user=None, remarks=None, accepted_label='Accepted'):
+                  rejected_qty=None, shortage_qty=None, missing_qty=None, user=None, remarks=None,
+                  accepted_label='Accepted', remarks_label='Remarks', details=None):
     """Format one module's cell — the same multi-line block for Preview and Excel."""
     if status in ('Not Reached', 'Not Applicable'):
         return 'IN : --\nOUT: --\nLot Qty : --\nStatus : ' + status
@@ -169,16 +185,33 @@ def _module_cell(status, in_time=None, out_time=None, lot_qty=None, accepted_qty
         lines.append(f"{accepted_label} : {accepted_qty}")
     if rejected_qty is not None:
         lines.append(f"Rejected : {rejected_qty}")
+    if shortage_qty:
+        lines.append(f"Shortage : {shortage_qty}")
+    if missing_qty:
+        lines.append(f"Missing Qty : {missing_qty}")
+    for label, value in details or []:
+        lines.append(f"{label} : {value if value else '--'}")
     lines.append(f"Status : {status}")
     if user:
         lines.append(f"User : {user}")
     if remarks:
-        lines.append(f"Remarks : {remarks}")
+        lines.append(f"{remarks_label} : {remarks}")
     return '\n'.join(lines)
 
 
+def _append_module_remarks(cell, *values):
+    """Append distinct saved remarks to their own module cell."""
+    if 'Status : Not Reached' in cell or 'Status : Not Applicable' in cell:
+        return cell
+    for value in values:
+        text = str(value or '').strip()
+        if text and f'Remarks : {text}' not in cell:
+            cell += f'\nRemarks : {text}'
+    return cell
+
+
 _TIME_LABELS = {'IN', 'OUT'}
-_QTY_LABELS = {'Lot Qty', 'Accepted', 'Loaded Jig', 'Rejected'}
+_QTY_LABELS = {'Lot Qty', 'Accepted', 'Loaded Jig', 'Unloaded Qty', 'Rejected', 'Shortage', 'Missing Qty'}
 _STATUS_LABELS = {'Status'}
 
 
@@ -193,6 +226,45 @@ def _cell_line_type(label):
     return 'muted'
 
 
+def _wiping_source_history(cell, sources):
+    """Show the saved unloading origins and the last-model rejection rule."""
+    rendered = []
+    for block in cell.split('\n\n'):
+        fields = dict(line.split(' : ', 1) for line in block.splitlines() if ' : ' in line)
+        quantities = [source['qty'] for source in sources]
+        if fields.get('Lot Qty') != str(sum(quantities)):
+            # Do not attach an old allocation to a different rework receipt.
+            rendered.append(block)
+            continue
+        history = [f'Previous History : Lot Qty {sum(quantities)}']
+        for index, source in enumerate(sources, 1):
+            history.append(f'M{index} : {source["model"]} - {source["jig_id"]} = {source["qty"]}')
+        history.append('Total Lot Qty : ' + ' + '.join(map(str, quantities)) + f' = {sum(quantities)}')
+        lines = block.splitlines()
+        insert_at = next((i + 1 for i, line in enumerate(lines) if line.startswith('Lot Qty : ')), len(lines))
+        lines[insert_at:insert_at] = history
+        if fields.get('Status') in ('Accepted', 'Partially Accepted', 'Rejected'):
+            accepted = int(fields.get('Accepted', '0'))
+            rejected = int(fields.get('Rejected', '0'))
+            action_at = next((i for i, line in enumerate(lines) if line.startswith(('Accepted : ', 'Rejected : '))), len(lines))
+            lines.insert(action_at, 'Wiping Action : Accept / Reject')
+            if accepted == 0 and rejected == sum(quantities):
+                current = [0] * len(quantities)
+            elif rejected <= quantities[-1] and accepted + rejected == sum(quantities):
+                current = quantities[:-1] + [quantities[-1] - rejected]
+            else:
+                current = None
+            lines.append(f'Current Info : Lot Qty {accepted}')
+            if current is not None:
+                for index, (source, qty) in enumerate(zip(sources, current), 1):
+                    lines.append(f'M{index} : {source["model"]} - {source["jig_id"]} = {qty}')
+            else:
+                lines.append('Note : Rejection exceeds the last model quantity; model allocation requires verification.')
+            lines.append(f'Total Lot Qty : {accepted}')
+        rendered.append('\n'.join(lines))
+    return '\n\n'.join(rendered)
+
+
 def _parse_cell_lines(text):
     """Turn one `_module_cell()` text block into structured
     {label, value, type} rows so the Preview UI can render a readable
@@ -205,6 +277,9 @@ def _parse_cell_lines(text):
         lines = []
         for line in block.split('\n'):
             if ':' not in line:
+                title = line.strip()
+                if title:
+                    lines.append({'label': '', 'value': title, 'type': 'heading'})
                 continue
             label, _, value = line.partition(':')
             label, value = label.strip(), value.strip()
@@ -259,6 +334,7 @@ class JourneyRecords:
         self.submission_history = defaultdict(lambda: defaultdict(list))
         self.rw_quantities = {}
         self.is_quantities = defaultdict(dict)
+        self.ba_rejection_remarks = {}
         self.dp_transfers = {}
         self.dp_batches = {}
         self.na_partial_accept_parent = {}
@@ -382,6 +458,33 @@ class JourneyRecords:
             for row in model.objects.filter(parent_lot_id__in=lot_ids).values(
                     'parent_lot_id').annotate(quantity=Sum(field)):
                 self.is_quantities[row['parent_lot_id']][field] = row['quantity']
+        # Shortage is stored in the Input Screening rejection-reasons snapshot,
+        # but intentionally excluded from IS_PartialRejectLot.rejected_qty
+        # because it has no physical reject tray. Preserve that distinction in
+        # the report by displaying it as its own quantity line.
+        reject_model = apps.get_model('InputScreening', 'IS_PartialRejectLot')
+        for row in reject_model.objects.filter(parent_lot_id__in=lot_ids).values(
+                'parent_lot_id', 'rejection_reasons'):
+            shortage_qty = sum(
+                int(reason.get('qty') or 0)
+                for reason in (row['rejection_reasons'] or {}).values()
+                if isinstance(reason, dict) and (
+                    reason.get('is_shortage')
+                    or 'shortage' in str(reason.get('reason') or '').lower()
+                )
+            )
+            if shortage_qty:
+                quantities = self.is_quantities[row['parent_lot_id']]
+                quantities['shortage_qty'] = (
+                    int(quantities.get('shortage_qty') or 0) + shortage_qty
+                )
+        model = apps.get_model('BrassAudit', 'Brass_Audit_Rejection_ReasonStore')
+        for row in model.objects.filter(
+                lot_id__in=lot_ids,
+                lot_rejected_comment__isnull=False,
+        ).exclude(lot_rejected_comment='').order_by('created_at', 'pk').values(
+                'lot_id', 'lot_rejected_comment'):
+            self.ba_rejection_remarks[row['lot_id']] = row['lot_rejected_comment']
         # IQF's incoming quantity is the receiving lot's rejection allocation,
         # not the full original batch quantity. Use the latest saved allocation.
         for app, name in [('Brass_QC', 'Brass_QC_Rejection_ReasonStore'),
@@ -805,7 +908,35 @@ def _early_module_cells(stocks_for_batch, prev_out_time=None, records=None):
     return cells, statuses, activity
 
 
-def _jig_loading_cells(jig_record, prev_out_time=None, records=None, lot_id=None):
+def _jig_loading_cells(jig_record, prev_out_time=None, records=None, lot_id=None,
+                       plating_stock_no=None, _history_item=False):
+    # A lot can be loaded in more than one jig.  Keep every loading event in
+    # the report so a completed first load is not hidden when its remaining
+    # quantity is later used as an added model in another jig.
+    history = getattr(jig_record, '_report_jig_history', None) if jig_record else None
+    if not _history_item and history and len(history) > 1:
+        results = [
+            _jig_loading_cells(record, prev_out_time=prev_out_time,
+                               records=records, lot_id=lot_id,
+                               plating_stock_no=plating_stock_no,
+                               _history_item=True)
+            for record in history
+        ]
+        jig_cells = [result[0] for result in results if result[0]]
+        ip_cells = [result[1] for result in results
+                    if result[1] and 'Status : Not Reached' not in result[1]]
+        jig_statuses = [result[2] for result in results if result[2]]
+        ip_statuses = [result[3] for result in results if result[3]]
+        activities = [result[4] for result in results if result[4] is not None]
+        return (
+            '\n\n'.join(jig_cells),
+            '\n\n'.join(ip_cells) if ip_cells else _module_cell('Not Reached'),
+            'In Progress' if 'In Progress' in jig_statuses else
+            (jig_statuses[-1] if jig_statuses else None),
+            'In Progress' if 'In Progress' in ip_statuses else
+            (ip_statuses[-1] if ip_statuses else None),
+            _latest_time(*activities),
+        )
     entry = records.entry(STAGE_JIG_LOADING, lot_id) if records else None
     submission = records.submission(STAGE_JIG_LOADING, lot_id) if records else None
     if not jig_record and not submission and entry is None:
@@ -820,7 +951,188 @@ def _jig_loading_cells(jig_record, prev_out_time=None, records=None, lot_id=None
             values['lot_qty'] = jig_record.original_lot_qty
         values['remarks'] = _first_remark(jig_record.pick_remarks, jig_record.remarks)
     values.update(submission_values(STAGE_JIG_LOADING, submission))
-    jig_cell = _module_cell(**values, accepted_label='Loaded Jig')
+    # Before loading is completed, the report has only the received lot.
+    # Model role, jig details, broken hooks, and loaded quantity are final
+    # transaction data and must not be shown yet.
+    if not submitted:
+        jig_cell = '\n'.join([
+            f'IN : {_fmt((entry or {}).get("in_time")) or "--"}',
+            'OUT: --',
+            f'Lot Qty : {values.get("lot_qty") if values.get("lot_qty") is not None else "--"}',
+            'Status : In Progress',
+        ])
+        activity = _latest_time(values['in_time'], values['out_time'])
+        return jig_cell, _module_cell('Not Reached'), 'In Progress', None, activity
+    allocations = [allocation for allocation in (getattr(jig_record, 'multi_model_allocation', None) or [])
+                   if isinstance(allocation, dict) and allocation.get('lot_id')]
+    primary = None
+    primary_lot_id = None
+    loaded_qty = getattr(jig_record, 'loaded_cases_qty', 0) or 0
+    is_excess_lot = str(lot_id or '').startswith('EX-')
+
+    def allocation_qty(allocation):
+        return int(allocation.get('allocated_qty') or 0)
+
+    # Both the primary and balance-lot report paths need this shared combined
+    # jig identity for their IP Inspection note and 98 quantity.
+    if len(allocations) > 1:
+        primary = next((allocation for allocation in allocations
+                        if allocation.get('role') == 'primary'), allocations[0])
+        primary_lot_id = str(primary.get('lot_id') or '')
+        loaded_qty = (getattr(jig_record, 'loaded_cases_qty', 0)
+                      or sum(allocation_qty(allocation) for allocation in allocations))
+    # An added model is identified from the saved allocation, not from its
+    # lot-id prefix.  This makes the report work for a normal 4-qty lot added
+    # to a 140-qty primary lot as well as generated EX balance lots.
+    is_added_model_lot = (
+        len(allocations) > 1
+        and str(lot_id or '') != primary_lot_id
+    )
+
+    # A balance lot is rendered beneath its original lot, never as a separate
+    # duplicate report row.
+    if is_added_model_lot:
+        secondary = next((allocation for allocation in allocations
+                          if str(allocation.get('lot_id') or '') == str(lot_id)), None)
+        secondary_index = allocations.index(secondary) + 1 if secondary else None
+        heading = (f'Added Model - Model {secondary_index}' if secondary else
+                   'Primary Model')
+        if not submitted:
+            jig_cell = '\n'.join([
+                f'IN : {_fmt((entry or {}).get("in_time")) or "--"}',
+                'OUT: --',
+                f'Lot Qty : {allocation_qty(secondary) if secondary else (values.get("lot_qty") if values.get("lot_qty") is not None else "--")}',
+                'Status : Yet to be Loaded',
+            ])
+        elif secondary:
+            source_entry = records.entry(STAGE_JIG_LOADING, lot_id) if records else None
+            source_submission = records.submission(STAGE_JIG_LOADING, lot_id) if records else None
+            source_values = submission_values(STAGE_JIG_LOADING, source_submission)
+            jig_cell = '\n'.join([
+                heading,
+                f'PLATING STK NO : {plating_stock_no or secondary.get("model") or secondary.get("model_no") or "--"}',
+                f'IN : {_fmt((source_entry or {}).get("in_time")) or _fmt((entry or {}).get("in_time")) or "--"}',
+                f'OUT: {_fmt(source_values.get("out_time")) or _fmt(values.get("out_time")) or "--"}',
+                f'JIG ID : {getattr(jig_record, "jig_id", None) or "--"}',
+                f'Lot Qty : {allocation_qty(secondary)}',
+                f'Broken Hook : {getattr(jig_record, "broken_hooks", 0) or 0}',
+                f'Loaded Qty : {allocation_qty(secondary)}',
+                'Status : Completed',
+            ])
+        else:
+            jig_cell = _module_cell(**values, accepted_label='Loaded Jig')
+    elif not allocations:
+        model = (plating_stock_no or getattr(jig_record, 'plating_stock_num', None)
+                 or '--')
+        jig_cell = '\n'.join([
+            f'PLATING STK NO : {model}',
+            f'IN : {_fmt((entry or {}).get("in_time")) or "--"}',
+            f'OUT: {_fmt(values.get("out_time")) or "--"}',
+            'Primary Model',
+            f'JIG ID : {getattr(jig_record, "jig_id", None) or "--"}',
+            f'Lot Qty : {values.get("lot_qty") if values.get("lot_qty") is not None else "--"}',
+            f'Broken Hook : {getattr(jig_record, "broken_hooks", 0) or 0}',
+            f'Loaded Qty : {getattr(jig_record, "loaded_cases_qty", 0) or 0}',
+            f'Status : {values["status"]}',
+        ])
+    else:
+        jig_cell = _module_cell(**values, accepted_label='Loaded Jig')
+    # A completed primary lot in a multi-model jig remains one primary-model
+    # transaction. Its added lot is reported from that added lot's own
+    # balance history, rather than creating a second block here.
+    primary_compact = False
+    if len(allocations) > 1 and not is_added_model_lot:
+        primary = next((allocation for allocation in allocations
+                        if allocation.get('role') == 'primary'), allocations[0])
+        primary_lot_id = str(primary.get('lot_id') or '')
+        loaded_qty = (getattr(jig_record, 'loaded_cases_qty', 0)
+                      or sum(allocation_qty(allocation) for allocation in allocations))
+        if str(lot_id or '') == primary_lot_id:
+            primary_model = primary.get('model') or primary.get('model_no') or plating_stock_no or '--'
+            source_entry = records.entry(STAGE_JIG_LOADING, primary_lot_id) if records else None
+            source_submission = records.submission(STAGE_JIG_LOADING, primary_lot_id) if records else None
+            source_values = submission_values(STAGE_JIG_LOADING, source_submission)
+            jig_cell = '\n'.join([
+                f'PLATING STK NO : {primary_model}',
+                f'IN : {_fmt((source_entry or {}).get("in_time")) or "--"}',
+                f'OUT: {_fmt(source_values.get("out_time")) or "--"}',
+                'Primary Model',
+                f'JIG ID : {getattr(jig_record, "jig_id", None) or "--"}',
+                f'Lot Qty : {allocation_qty(primary)}',
+                f'Broken Hook : {getattr(jig_record, "broken_hooks", 0) or 0}',
+                f'Loaded Qty : {allocation_qty(primary)}',
+                f'Status : {values["status"]}',
+            ])
+            primary_compact = True
+    display_values = dict(values)
+    if len(allocations) > 1:
+        # Individual source quantities are not independently loaded; both
+        # sources share the final combined Jig Loaded Qty.
+        display_values.pop('accepted_qty', None)
+    if len(allocations) > 1 and not is_added_model_lot and not primary_compact:
+        primary = next((allocation for allocation in allocations
+                        if allocation.get('role') == 'primary'), allocations[0])
+        primary_lot_id = str(primary.get('lot_id') or '')
+        quantity = allocation_qty
+        loaded_qty = (getattr(jig_record, 'loaded_cases_qty', 0)
+                      or sum(quantity(allocation) for allocation in allocations))
+        jig_capacity = (getattr(jig_record, 'effective_capacity', 0)
+                        or getattr(jig_record, 'jig_capacity', 0))
+        ordered = [primary] + [a for a in allocations if a is not primary]
+        blocks = []
+        for index, allocation in enumerate(ordered, 1):
+            source = str(allocation.get('lot_id') or '')
+            source_entry = records.entry(STAGE_JIG_LOADING, source) if records else None
+            source_submission = records.submission(STAGE_JIG_LOADING, source) if records else None
+            source_values = submission_values(STAGE_JIG_LOADING, source_submission)
+            lines = [
+                f"IN : {_fmt((source_entry or {}).get('in_time')) or '--'}",
+                f"OUT: {_fmt(source_values.get('out_time')) or '--'}",
+            ]
+            if index == 1:
+                lines.append(f'Jig Cap : {jig_capacity or "--"}')
+            else:
+                lines.append(f'Add Model - Model {index}')
+            lines.extend([
+                f'Primary : {primary.get("model") or primary.get("model_no") or "--"}',
+                f'Model : {allocation.get("model") or allocation.get("model_no") or "--"}',
+                f'Jig ID : {getattr(jig_record, "jig_id", None) or "--"}',
+                f'Lot Qty : {quantity(allocation)}',
+            ])
+            if index == 1 and jig_capacity:
+                lines.append(f'Calc : {jig_capacity} - {quantity(primary)} = {max(0, jig_capacity - quantity(primary))}')
+            if index == 1:
+                # The primary is already identified by its Primary label.
+                lines = [line for line in lines if not line.startswith('Model : ')]
+            else:
+                # Added sources are a breakdown of this jig, not another
+                # primary transaction inside the primary report row.
+                lines = [
+                    f"IN : {_fmt((source_entry or {}).get('in_time')) or '--'}",
+                    f"OUT: {_fmt(source_values.get('out_time')) or '--'}",
+                    f'Add Model - Model {index} : {allocation.get("model") or allocation.get("model_no") or "--"}',
+                    f'Jig ID : {getattr(jig_record, "jig_id", None) or "--"}',
+                    f'Broken Hook : {getattr(jig_record, "broken_hooks", 0) or 0}',
+                ]
+            if index > 1:
+                lines.append(f'Added Qty : {quantity(allocation)}')
+                lines.append(
+                    f'Calc : {quantity(allocation)} + {quantity(primary)} = {loaded_qty}'
+                )
+            blocks.append('\n'.join(lines))
+        # Every source row displays the same combined Jig Loading record in
+        # the same order: primary section, added-model section, then total.
+        excess_qty = max(0, sum(quantity(a) for a in ordered) - int(jig_capacity or 0))
+        blocks[-1] += f'\nJig Loaded Qty : {loaded_qty}'
+        if excess_qty:
+            operands = ' + '.join(str(quantity(a)) for a in ordered)
+            blocks[-1] += f'\nExcess : {operands} - {jig_capacity} = {excess_qty}'
+        else:
+            blocks[-1] += '\nExcess : No Excess'
+        blocks[-1] += f"\nStatus : {values['status']}"
+        if values.get('remarks'):
+            blocks[-1] += f"\nRemarks : {values['remarks']}"
+        jig_cell = '\n\n'.join(blocks)
     activity = _latest_time(values['in_time'], values['out_time'])
     # A submitted loading record is the actual handoff into IP Inspection.
     # IP_loaded_date_time belongs to IP Inspection, never Jig Loading.
@@ -829,9 +1141,40 @@ def _jig_loading_cells(jig_record, prev_out_time=None, records=None, lot_id=None
     ip_done = bool(jig_record.jig_position)
     ip_out = jig_record.IP_loaded_date_time if ip_done else None
     ip_status = 'Completed' if ip_done else 'In Progress'
+    ip_remarks = jig_record.remarks
+    if primary is not None:
+        primary_model = str(primary.get('model') or primary.get('model_no') or '--')
+        if str(lot_id or '') == primary_lot_id:
+            combined_note = (
+                'Combined with Added Model; Plating Stk No: '
+                + str(plating_stock_no or primary_model)
+            )
+        else:
+            combined_note = (
+                'Combined with Primary Model; Plating Stk No: '
+                + str(plating_stock_no or primary_model)
+            )
+        ip_remarks = _combined_remarks(
+            ('', ip_remarks),
+            ('', combined_note),
+        )
+    combined_source = next((allocation for allocation in allocations
+                            if str(allocation.get('lot_id') or '') == str(lot_id or '')), None)
+    ip_lot_qty = (allocation_qty(combined_source)
+                  if combined_source is not None else
+                  (loaded_qty if len(allocations) > 1
+                   else values.get('accepted_qty', jig_record.loaded_cases_qty)))
+    ip_details = []
+    if len(allocations) > 1:
+        ip_details.append(('Jig Qty', loaded_qty))
+    ip_details.append(('Jig ID', getattr(jig_record, 'jig_id', None)))
+    bath_number = getattr(getattr(jig_record, 'bath_numbers', None), 'bath_number', None)
+    if bath_number:
+        ip_details.append(('Bath No', bath_number))
     ip_cell = _module_cell(ip_status, in_time=values['out_time'], out_time=ip_out,
-                           lot_qty=values.get('accepted_qty', jig_record.loaded_cases_qty),
-                           remarks=jig_record.remarks)
+                           lot_qty=ip_lot_qty,
+                           remarks=ip_remarks, remarks_label='Note',
+                           details=ip_details)
     return jig_cell, ip_cell, values['status'], ip_status, _latest_time(activity, ip_out)
 
 
@@ -843,17 +1186,42 @@ def _late_module_cells(unload_record, zone_map, prev_out_time=None, records=None
     zone = zone_map.get(unload_record.plating_color_id if unload_record else plating_color_id)
     activity = None
     latest_audit = None
+    source_quantities = getattr(unload_record, '_report_source_quantities', {})
+    source_qty = source_quantities.get(lot_id)
+    combined_qty = sum(source_quantities.values())
 
+    jig_allocations = [allocation for allocation in (
+        getattr(jig_record, 'multi_model_allocation', None) or []
+    ) if isinstance(allocation, dict) and allocation.get('lot_id')]
+    jig_primary = next((allocation for allocation in jig_allocations
+                        if allocation.get('role') == 'primary'),
+                       jig_allocations[0] if jig_allocations else None)
+    # A primary model that had another model added during Jig Loading uses
+    # the normal compact Nickel Wiping receipt. The detailed source-history
+    # format remains for models combined during Jig Unloading.
+    is_jig_loading_multi_model_primary = bool(
+        jig_primary
+        and len(jig_allocations) > 1
+        and str(jig_primary.get('lot_id') or '') == str(lot_id or '')
+    )
+    jig_source = next((allocation for allocation in jig_allocations
+                       if str(allocation.get('lot_id') or '') == str(lot_id or '')), None)
+    combined_jig_qty = getattr(jig_record, 'loaded_cases_qty', 0) or 0
+    source_jig_qty = (int(jig_source.get('allocated_qty') or 0)
+                      if jig_source is not None else None)
     # IP Inspection receives the quantity accepted by the corresponding Jig
     # Loading submission.  A JigCompleted record can represent several lots,
     # so its loaded_cases_qty may be the whole jig quantity and must not be
     # used for this individual lot's Jig Unloading receipt.
     jig_loading_submission = records.submission(STAGE_JIG_LOADING, lot_id) if records else None
-    ip_received_qty = submission_values(
-        STAGE_JIG_LOADING, jig_loading_submission
-    ).get('accepted_qty') if jig_loading_submission else None
+    ip_received_qty = (
+        source_jig_qty if source_jig_qty is not None else
+        (submission_values(STAGE_JIG_LOADING, jig_loading_submission).get('accepted_qty')
+         if jig_loading_submission else None)
+    )
     if ip_received_qty is None and jig_record:
         ip_received_qty = jig_record.loaded_cases_qty
+    unloading_lot_qty = source_jig_qty if source_jig_qty is not None else ip_received_qty
 
     def put(name, values):
         nonlocal activity
@@ -861,20 +1229,31 @@ def _late_module_cells(unload_record, zone_map, prev_out_time=None, records=None
         statuses[name] = values['status']
         activity = _latest_time(activity, values.get('in_time'), values.get('out_time'))
 
+    # IP Inspection has not handed the jig to Unloading until its own submit
+    # creates the completed jig position. Do not expose an unloading receipt,
+    # or any later stage, while that IP transaction remains in progress.
+    if not (jig_record and jig_record.jig_position):
+        return cells, statuses, activity
+
     unloading_entry = records.entry('Jig Unloading', lot_id) if records else None
     unloading_submission = records.submission('Jig Unloading', lot_id) if records else None
-    if (zone and jig_record and jig_record.IP_loaded_date_time
-            and (jig_record.last_process_module == 'Inprocess Inspection'
-                 or jig_record.jig_position)):
+    if zone and jig_record and jig_record.IP_loaded_date_time:
         # Inspection submit is the actual handoff opening Unloading Pick.
         unloading_entry = dict(unloading_entry or {})
         unloading_entry['in_time'] = _earliest(
             unloading_entry.get('in_time'), jig_record.IP_loaded_date_time)
-        unloading_entry.setdefault('lot_qty', ip_received_qty)
+        unloading_entry.setdefault('lot_qty', unloading_lot_qty)
     if zone and unloading_entry is not None:
         values = dict(status='In Progress', in_time=unloading_entry.get('in_time'),
                       lot_qty=unloading_entry.get('lot_qty'))
-        values.update(submission_values('Jig Unloading', unloading_submission))
+        # Saving tray rows is not the final unloading action.  A Jig Unloading
+        # submission becomes complete only when Submit All creates its
+        # JigUnloadAfterTable handoff record.
+        if unload_record:
+            values.update(submission_values('Jig Unloading', unloading_submission))
+        if source_jig_qty is not None:
+            values['lot_qty'] = source_jig_qty
+            values['details'] = [('Jig Qty', combined_jig_qty)]
         put(f'Jig Unloading {zone.upper()}', values)
     if not unload_record:
         return cells, statuses, activity
@@ -938,15 +1317,21 @@ def _late_module_cells(unload_record, zone_map, prev_out_time=None, records=None
         # the real handoff into Nickel Audit.
         wiping_completed_at = max((record.created_at for record in wiping_history),
                                   default=None)
-        ju_done = bool(jig_unload_source.unload_accepted or jig_unload_source.Un_loaded_date_time
-                       or wiping_started_at)
+        # An unload timestamp or a later module must not complete Jig
+        # Unloading. Only its own final submitted record is confirmation that
+        # the lot was actually unloaded.
+        ju_done = bool(
+            jig_unloading_submission
+            and not getattr(jig_unloading_submission, 'is_draft', False)
+        )
         # Preserve the quantity handed off by IP Inspection. Later unloading
         # or Nickel allocations can be smaller, but must not rewrite the
         # historical Jig Unloading receipt quantity.
         jig_unload_lot_qty = (
-            ip_received_qty
-            if ip_received_qty is not None
-            else jig_unload_source.total_case_qty
+            source_jig_qty
+            if source_jig_qty is not None else
+            (ip_received_qty if ip_received_qty is not None
+             else jig_unload_source.total_case_qty)
         )
         jig_unload_accepted_qty = submission_values(
             'Jig Unloading', jig_unloading_submission
@@ -959,13 +1344,75 @@ def _late_module_cells(unload_record, zone_map, prev_out_time=None, records=None
                 0, (jig_unload_lot_qty or 0)
                 - (jig_unload_source.unload_missing_qty or 0)
             )
+        if source_qty is not None:
+            # Nickel ledgers describe the combined transfer; project its
+            # outcome only after matching the full saved receipt quantity.
+            jig_unload_accepted_qty = combined_qty
+        unload_display_qty = (source_qty if source_qty is not None
+                              else jig_unload_accepted_qty)
+        jig_unload_missing_qty = max(
+            0, (jig_unload_lot_qty or 0) - (unload_display_qty or 0)
+        )
+        combined_remark = None
+        if source_qty is not None and len(source_quantities) > 1:
+            other_qty = combined_qty - source_qty
+            combined_remark = (
+                f'Added model qty: {other_qty}. '
+                f'Combined unloading qty: {combined_qty}.'
+            )
         put(f'Jig Unloading {zone.upper()}', dict(
-            status=('Accepted' if jig_unload_source.unload_accepted else 'Completed') if ju_done else 'In Progress',
+            status='Completed' if ju_done else 'In Progress',
             in_time=(jig_unloading_entry or {}).get('in_time') or jig_unload_source.created_at,
             out_time=(jig_unload_source.Un_loaded_date_time or wiping_started_at)
                      if ju_done else None,
             lot_qty=jig_unload_lot_qty,
-            accepted_qty=jig_unload_accepted_qty if ju_done else None))
+            accepted_qty=unload_display_qty if ju_done else None,
+            accepted_label='Unloaded Qty',
+            missing_qty=jig_unload_missing_qty if ju_done else None,
+            details=[
+                ('Jig ID', getattr(jig_record, 'jig_id', None)),
+                ('Jig Qty', getattr(jig_record, 'loaded_cases_qty', None)),
+            ],
+            remarks=combined_remark))
+        combined_cells = getattr(unload_record, '_report_combined_unloading_cells', {})
+        # A whole-jig add-model transaction (for example 98 + 98) takes
+        # precedence over the legacy per-source blocks built from its models.
+        combined_cell = getattr(unload_record, '_report_combined_unloading_cell', None)
+        combined_cell = combined_cell or (
+            combined_cells.get(str(lot_id or ''))
+            if isinstance(combined_cells, dict) else None
+        )
+        if ju_done and combined_cell:
+            cells[f'Jig Unloading {zone.upper()}'] = combined_cell
+        if getattr(unload_record, '_report_combined_secondary', False):
+            # Keep this source's own Jig Unloading block, then carry the
+            # primary combined Nickel history into it.  The caller appends
+            # that history beside a hidden balance lot's unloading block.
+            combined_transfer = getattr(unload_record, '_report_combined_transfer', None)
+            if combined_transfer:
+                primary_unload, primary_lot_id = combined_transfer
+                primary_jig = None
+                if records:
+                    # The primary submission's Jig ID is already present in
+                    # the current report map; find it from the source mapping
+                    # through the passed JigCompleted relationship instead of
+                    # changing the displayed added-lot jig.
+                    primary_jig = jig_record
+                    allocations = getattr(jig_record, 'multi_model_allocation', None) or []
+                    if not any(str(a.get('lot_id') or '') == str(primary_lot_id)
+                               for a in allocations if isinstance(a, dict)):
+                        primary_jig = None
+                primary_cells, primary_statuses, primary_activity = _late_module_cells(
+                    primary_unload, zone_map, records=records,
+                    lot_id=primary_lot_id, plating_color_id=plating_color_id,
+                    jig_record=primary_jig or jig_record,
+                )
+                for name in ('Nickel Wiping Z1', 'Nickel Wiping Z2',
+                             'Nickel Audit Z1', 'Nickel Audit Z2'):
+                    cells[name] = primary_cells[name]
+                    statuses[name] = primary_statuses[name]
+                activity = _latest_time(activity, primary_activity)
+            return cells, statuses, activity
         # Nickel Audit can be entered again after a return through Nickel
         # Wiping. Collect its ledger across the same child/parent lineage as
         # wiping so an earlier Audit transaction is never replaced by the
@@ -1081,6 +1528,24 @@ def _late_module_cells(unload_record, zone_map, prev_out_time=None, records=None
                 values['lot_qty'] = wiping_receipt_qty(
                     getattr(submission, 'created_at', None)
                 )
+                if is_jig_loading_multi_model_primary:
+                    # A primary Jig Loading model hands the entire combined
+                    # jig to Nickel Wiping. Its own source share (for example
+                    # 40) must not replace the 98-qty Jig Unloading receipt.
+                    values['lot_qty'] = combined_jig_qty
+                    values['in_time'] = (
+                        getattr(jig_unload_source, 'Un_loaded_date_time', None)
+                        or values.get('in_time')
+                    )
+                # Child/source unload records can point at an earlier parent.
+                # Preserve the total from the combined Add Model transaction
+                # that selected this report row (for example 98+98+98=294).
+                combined_unload_qty = (
+                    getattr(unload_record, '_report_combined_jig_qty', None)
+                    or getattr(jig_unload_source, '_report_combined_jig_qty', None)
+                )
+                if combined_unload_qty:
+                    values['lot_qty'] = combined_unload_qty
             elif stage == 'Nickel Audit':
                 values['lot_qty'] = audit_receipt_qty(
                     getattr(submission, 'created_at', None)
@@ -1124,6 +1589,10 @@ def _late_module_cells(unload_record, zone_map, prev_out_time=None, records=None
                 activity = _latest_time(activity, history_activity)
             else:
                 put(f'{stage} {zone.upper()}', values)
+    wiping_sources = getattr(unload_record, '_report_wiping_sources', None)
+    if wiping_sources and zone and not is_jig_loading_multi_model_primary:
+        name = f'Nickel Wiping {zone.upper()}'
+        cells[name] = _wiping_source_history(cells[name], wiping_sources)
     for number in (1, 2):
         stage = f'Spider Spindle Z{number}'
         entry = records.entry(stage, unload_record.lot_id) if records else None
@@ -1208,7 +1677,7 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
     rows that have reached the selected report stage.
     """
     from modelmasterapp.models import TotalStockModel, Plating_Color, ModelMasterCreation
-    from Jig_Loading.models import JigCompleted
+    from Jig_Loading.models import JigCompleted, ExcessLotRecord
     from Jig_Unloading.models import JigUnloadAfterTable
 
     stock_qs = TotalStockModel.objects.filter(
@@ -1217,14 +1686,53 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
         remove_lot=False,
     ).select_related('batch_id').order_by('-created_at', '-pk')
 
-    if plating_stock_no:
-        stock_qs = stock_qs.filter(
-            batch_id__plating_stk_no__icontains=plating_stock_no.strip()
-        )
-
     stocks = list(stock_qs)
     lot_ids = {s.lot_id for s in stocks if s.lot_id}
-    batch_ids = {s.batch_id_id for s in stocks if s.batch_id_id}
+    split_records = list(ExcessLotRecord.objects.select_related('jig_loading_record'))
+    split_quantities = {r.new_lot_id: r.lot_qty for r in split_records}
+    split_sources = {}
+    for split in split_records:
+        loading = split.jig_loading_record
+        # A multi-model jig's primary lot need not own the remainder.
+        sources = {}
+        for tray in loading.tray_data or []:
+            source = tray.get('source_lot_id')
+            qty = int(tray.get('excess_qty', 0) or 0)
+            if source and qty > 0:
+                sources[source] = sources.get(source, 0) + qty
+        if not sources:
+            for allocation in loading.multi_model_allocation or []:
+                source = allocation.get('lot_id')
+                requested = allocation.get('requested_qty', allocation.get('model_lot_qty'))
+                if source and requested is not None:
+                    qty = int(requested or 0) - int(allocation.get('allocated_qty', 0) or 0)
+                    if qty > 0:
+                        sources[source] = sources.get(source, 0) + qty
+        if len(sources) == 1 and sum(sources.values()) == split.lot_qty:
+            split_sources[split.new_lot_id] = next(iter(sources))
+        elif not loading.is_multi_model:
+            split_sources[split.new_lot_id] = split.parent_lot_id
+    source_batches = dict(TotalStockModel.objects.filter(
+        lot_id__in=set(split_sources.values())).values_list('lot_id', 'batch_id_id'))
+    split_batches = {}
+    for child in split_sources:
+        source, seen = child, set()
+        while source in split_sources and source not in seen:
+            seen.add(source)
+            source = split_sources[source]
+        if source not in split_quantities and source_batches.get(source):
+            split_batches[child] = source_batches[source]
+    source_batch_objects = ModelMasterCreation.objects.in_bulk(set(split_batches.values()))
+    if plating_stock_no:
+        matching_batch_ids = set(ModelMasterCreation.objects.filter(
+            plating_stk_no__icontains=plating_stock_no.strip()
+        ).values_list('pk', flat=True))
+        stocks = [
+            stock for stock in stocks
+            if split_batches.get(stock.lot_id, stock.batch_id_id) in matching_batch_ids
+        ]
+    batch_ids = ({s.batch_id_id for s in stocks if s.batch_id_id}
+                 | set(split_batches.get(s.lot_id) for s in stocks if s.lot_id in split_batches))
 
     # Every TotalStockModel row sharing a batch_id (root + every accept/reject
     # child ever created at Input Screening/Brass QC/IQF/Brass Audit) — needed
@@ -1248,11 +1756,15 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
 
     # Bulk maps — avoid N+1
     jig_by_lot = {}
-    for record in JigCompleted.objects.select_related('user').order_by('updated_at', 'pk').only(
+    jig_history_by_lot = {}
+    for record in JigCompleted.objects.select_related('user', 'bath_numbers').order_by('updated_at', 'pk').only(
         'lot_id', 'jig_position', 'updated_at', 'pick_remarks',
         'remarks', 'unloading_remarks', 'multi_model_allocation',
         'IP_loaded_date_time', 'original_lot_qty', 'updated_lot_qty',
-        'loaded_cases_qty', 'user', 'user__username', 'draft_status', 'last_process_module',
+        'loaded_cases_qty', 'jig_id', 'jig_capacity', 'effective_capacity', 'excess_qty',
+        'broken_hooks', 'plating_stock_num',
+        'bath_numbers__bath_number',
+        'user', 'user__username', 'draft_status', 'last_process_module',
     ):
         keys = {record.lot_id}
         for allocation in record.multi_model_allocation or []:
@@ -1260,7 +1772,35 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
                 keys.add(str(allocation['lot_id']))
         for key in keys:
             if key in lot_ids:
-                jig_by_lot[key] = record  # latest actual draft/submission wins
+                jig_history_by_lot.setdefault(key, []).append(record)
+                jig_by_lot[key] = record  # latest record drives downstream state
+
+    for key, history in jig_history_by_lot.items():
+        # The display uses the full sequence; downstream modules still use
+        # the newest record for their current-state calculations.
+        jig_by_lot[key]._report_jig_history = history
+
+    # Show generated balance lots inside their source lot's Jig Loading cell.
+    # This is the one place where the balance belongs in the consolidated
+    # journey; rendering its TotalStock row separately duplicates the quantity.
+    balance_lots_by_parent = {}
+    balance_child_ids = set()
+    for split in split_records:
+        parent_lot_id = split_sources.get(split.new_lot_id, split.parent_lot_id)
+        if parent_lot_id:
+            balance_lots_by_parent.setdefault(str(parent_lot_id), []).append(split)
+            balance_child_ids.add(str(split.new_lot_id))
+
+    def balance_descendants(parent_lot_id, seen=None):
+        """Yield every later Jig Loading balance from one original lot."""
+        seen = set() if seen is None else seen
+        for balance in balance_lots_by_parent.get(str(parent_lot_id), []):
+            child_lot_id = str(balance.new_lot_id)
+            if child_lot_id in seen:
+                continue
+            seen.add(child_lot_id)
+            yield balance
+            yield from balance_descendants(child_lot_id, seen)
 
     unload_by_lot = {}
     for record in JigUnloadAfterTable.objects.all().order_by('created_at', 'pk'):
@@ -1282,6 +1822,227 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
 
     records = JourneyRecords(lot_ids | {r.lot_id for r in unload_by_lot.values()})
     records.add_stock_receipts(row for group in stocks_by_batch.values() for row in group)
+
+    # Older unload rows sometimes retain only the primary source ID, while
+    # the submitted tray snapshot preserves every lot in the combined load.
+    combined_unloads = JigUnloadAfterTable.objects.filter(jig_qr_id__contains=',')
+    unload_candidates = {r.pk: r for r in unload_by_lot.values()}
+    unload_candidates.update({r.pk: r for r in combined_unloads})
+    for unload in list(unload_candidates.values()):
+        jig_ids = [item.strip() for item in str(unload.jig_qr_id or '').split(',') if item.strip()]
+        # Jig IDs are reused over time; select the newest completed record
+        # for each ID in this combined unloading transaction.
+        whole_jigs_by_id = {}
+        if len(jig_ids) > 1:
+            for candidate in JigCompleted.objects.filter(jig_id__in=jig_ids).order_by('-pk'):
+                whole_jigs_by_id.setdefault(candidate.jig_id, candidate)
+        whole_jigs = [whole_jigs_by_id[jig_id] for jig_id in jig_ids
+                      if jig_id in whole_jigs_by_id]
+        if len(whole_jigs) == len(jig_ids) and sum(j.loaded_cases_qty or 0 for j in whole_jigs) == unload.total_case_qty:
+            lines = ['Jig Unloading - Add Model', 'Plating Stk No : ' + str(getattr(whole_jigs[0], 'plating_stock_num', None) or '--')]
+            combined_sources = set(unload.combine_lot_ids or [])
+            for index, jig in enumerate(sorted(whole_jigs, key=lambda j: jig_ids.index(j.jig_id)), 1):
+                lines += ['IN TIME : ' + (_fmt(getattr(jig, 'IP_loaded_date_time', None)) or '--'), 'OUT TIME: ' + (_fmt(unload.Un_loaded_date_time) or '--'), f'Jig ID-{index} : {jig.jig_id}', f'Jig ID-{index} Qty : {jig.loaded_cases_qty}']
+                combined_sources.update(str(a.get('lot_id')) for a in (jig.multi_model_allocation or []) if a.get('lot_id'))
+            lines += [f'Unloaded Qty : {unload.total_case_qty}', 'Status : Completed']
+            unload._report_combined_unloading_cell = '\n'.join(lines)
+            unload._report_combined_jig_qty = unload.total_case_qty
+            for source in combined_sources:
+                if source in lot_ids: unload_by_lot[source] = unload
+        # A combined unloading can contain multi-model jigs. Collect every
+        # source mapping first so two complete 98 jigs (50+48 and 96+2) are
+        # treated as one 196 add-model unloading transaction.
+        all_mappings = []
+        for raw_source in unload.combine_lot_ids or []:
+            submitted = records.submission('Jig Unloading', _normalize_unload_lot_id(raw_source))
+            for tray in getattr(submitted, 'tray_data', None) or []:
+                all_mappings.extend((tray.get('_source_metadata') or {}).get('source_mappings', []))
+        by_jig = {}
+        for mapping in all_mappings:
+            jig_key = str(mapping.get('jig_completed_id') or mapping.get('jig_id') or '')
+            if jig_key:
+                by_jig.setdefault(jig_key, []).append(mapping)
+        if len(by_jig) > 1:
+            jigs = JigCompleted.objects.in_bulk({int(k) for k in by_jig if k.isdigit()})
+            details = []
+            sources = set()
+            for key, mappings in by_jig.items():
+                jig = jigs.get(int(key)) if key.isdigit() else None
+                qty = sum(int(m.get('qty') or 0) for m in mappings)
+                sources.update(str(m.get('lot_id')) for m in mappings if m.get('lot_id'))
+                details.append((jig, mappings[0], qty))
+            if len(details) > 1 and all((j.loaded_cases_qty if j else 0) == qty for j, _, qty in details):
+                lines = ['Jig Unloading - Add Model', 'Plating Stk No : ' + str(getattr(details[0][0], 'plating_stock_num', None) or '--')]
+                for index, (jig, mapping, qty) in enumerate(details, 1):
+                    lines += ['IN TIME : ' + (_fmt(getattr(jig, 'IP_loaded_date_time', None)) or '--'), 'OUT TIME: ' + (_fmt(unload.Un_loaded_date_time) or '--'), f'Jig ID-{index} : ' + str(mapping.get('jig_id') or '--'), f'Jig ID-{index} Qty : {qty}']
+                lines += ['Unloaded Qty : ' + str(sum(qty for _, _, qty in details)), 'Status : Completed']
+                unload._report_combined_unloading_cell = '\n'.join(lines)
+                unload._report_combined_jig_qty = sum(qty for _, _, qty in details)
+                for source in sources:
+                    if source in lot_ids: unload_by_lot[source] = unload
+        for raw_source in unload.combine_lot_ids or []:
+            submission = records.submission('Jig Unloading', _normalize_unload_lot_id(raw_source))
+            for tray in getattr(submission, 'tray_data', None) or []:
+                source_metadata = tray.get('_source_metadata') or {}
+                mappings = source_metadata.get('source_mappings', [])
+                quantities = {str(m['lot_id']): int(m.get('qty') or 0)
+                              for m in mappings if m.get('lot_id')}
+                if len(quantities) < 2 or any(q <= 0 for q in quantities.values()):
+                    continue
+                if sum(quantities.values()) != submission.total_qty:
+                    continue
+                unload._report_source_quantities = quantities
+                # Nickel partial acceptance creates child unload rows without
+                # an unloading timestamp. Keep the original handoff time.
+                receipt_unload = unload
+                seen_unload_ids = set()
+                while receipt_unload.lot_id not in seen_unload_ids:
+                    seen_unload_ids.add(receipt_unload.lot_id)
+                    parent_unload = (
+                        records.nq_partial_accept_parent_unloads.get(receipt_unload.lot_id)
+                        or records.na_partial_accept_parent_unloads.get(receipt_unload.lot_id)
+                    )
+                    if parent_unload is None:
+                        break
+                    receipt_unload = parent_unload
+                unloading_out_time = receipt_unload.Un_loaded_date_time
+                # Preserve the individual receipts in this unloading merge.
+                # Reuse the same display on every source report row.
+                source_blocks = []
+                wiping_sources = []
+                receipt_quantities = []
+                mapped_jigs = JigCompleted.objects.in_bulk({
+                    int(m['jig_completed_id']) for m in mappings
+                    if m.get('jig_completed_id')
+                })
+                jig_groups = {}
+                seen_sources = set()
+                for mapping in mappings:
+                    source = str(mapping.get('lot_id') or '')
+                    if source not in quantities or source in seen_sources:
+                        continue
+                    seen_sources.add(source)
+                    source_jig = (mapped_jigs.get(int(mapping['jig_completed_id']))
+                                  if mapping.get('jig_completed_id') else jig_by_lot.get(source))
+                    # Two models can share one physical jig.  They still
+                    # require separate unloading report blocks, one per
+                    # source lot (for example 54 and 44), rather than being
+                    # merged under the jig's primary key.
+                    key = source
+                    group = jig_groups.setdefault(key, {
+                        'source': source, 'jig': source_jig, 'mapping': mapping,
+                        'unloaded_qty': 0,
+                    })
+                    group['unloaded_qty'] += quantities[source]
+                source_cells = {}
+                source_jig_details = []
+                for index, group in enumerate(jig_groups.values(), start=1):
+                    source = group['source']
+                    source_jig = group['jig']
+                    mapping = group['mapping']
+                    loading = records.submission(STAGE_JIG_LOADING, source)
+                    jig_qty = (source_jig.loaded_cases_qty if source_jig
+                               else getattr(loading, 'loaded_cases_qty', None))
+                    # The shared jig holds the combined quantity, but each
+                    # report row retains this source model's own lot quantity.
+                    lot_qty = quantities[source]
+                    source_submission = records.submission('Jig Unloading', source)
+                    source_entry = records.entry('Jig Unloading', source) or {}
+                    unloaded_qty = group['unloaded_qty']
+                    receipt_quantities.append(lot_qty)
+                    # The unloading operation is against the complete shared
+                    # jig.  Show that completed jig quantity in each source
+                    # model's block, while Lot Qty remains the source amount.
+                    displayed_unloaded_qty = jig_qty if jig_qty is not None else unloaded_qty
+                    missing_qty = max(0, (jig_qty or 0) - displayed_unloaded_qty)
+                    # A combined unloading is reported per source jig.  Keep
+                    # the field order fixed so each completed block reads as
+                    # one physical jig-unloading transaction.
+                    block = '\n'.join([
+                        'IN : ' + (_fmt(getattr(source_jig, 'IP_loaded_date_time', None)
+                                         or source_entry.get('in_time')) or '--'),
+                        'OUT: ' + (_fmt(unloading_out_time) or '--'),
+                        'Jig ID : ' + str(mapping.get('jig_id') or '--'),
+                        'Jig Qty : ' + str(jig_qty if jig_qty is not None else '--'),
+                        'Lot Qty : ' + str(lot_qty),
+                        'Unloaded Jig : ' + str(displayed_unloaded_qty),
+                        'Missing Qty : ' + str(missing_qty),
+                        'Status : Completed',
+                    ])
+                    model_no = (getattr(source_submission, 'model_no', None)
+                                or getattr(submission, 'model_no', None) or '--')
+                    wiping_sources.append({'model': model_no,
+                                           'jig_id': mapping.get('jig_id') or '--',
+                                           'qty': unloaded_qty})
+                    source_blocks.append(block)
+                    source_cells[source] = block
+                    source_jig_details.append({
+                        'source': source,
+                        'stock_no': getattr(source_jig, 'plating_stock_num', None),
+                        'in_time': (getattr(source_jig, 'IP_loaded_date_time', None)
+                                    or source_entry.get('in_time')),
+                        'out_time': unloading_out_time,
+                        'jig_id': mapping.get('jig_id'),
+                        'jig_qty': jig_qty,
+                        'lot_qty': lot_qty,
+                    })
+                combined_cell = '\n\n'.join(source_blocks)
+                # When separate full jigs are added in one Jig Unloading
+                # transaction (for example, 98 + 98), display the add-model
+                # transaction as one two-jig record. Partial model shares
+                # such as 54 + 44 retain their individual source blocks.
+                is_full_jig_add_model = (
+                    len(source_jig_details) > 1
+                    and all(
+                        detail['jig_qty'] is not None
+                        and detail['lot_qty'] == detail['jig_qty']
+                        for detail in source_jig_details
+                    )
+                )
+                if is_full_jig_add_model:
+                    first = source_jig_details[0]
+                    add_model_lines = [
+                        'Jig Unloading - Add Model',
+                        'Plating Stk No : ' + str(first['stock_no'] or '--'),
+                    ]
+                    for index, detail in enumerate(source_jig_details, start=1):
+                        add_model_lines.extend([
+                            'IN TIME : ' + (_fmt(detail['in_time']) or '--'),
+                            'OUT TIME: ' + (_fmt(detail['out_time']) or '--'),
+                            f'Jig ID-{index} : ' + str(detail['jig_id'] or '--'),
+                            f'Jig ID-{index} Qty : ' + str(detail['jig_qty']),
+                        ])
+                    add_model_lines.extend([
+                        'Unloaded Qty : ' + str(sum(detail['lot_qty'] for detail in source_jig_details)),
+                        'Status : Completed',
+                    ])
+                    combined_cell = '\n'.join(add_model_lines)
+                    source_cells = {
+                        detail['source']: combined_cell
+                        for detail in source_jig_details
+                    }
+                unload._report_wiping_sources = wiping_sources
+                for source in quantities:
+                    if source in lot_ids and source not in unload_by_lot:
+                        unload_by_lot[source] = unload
+                    if source in unload_by_lot:
+                        target = unload_by_lot[source]
+                        existing = getattr(target, '_report_combined_unloading_cells', {})
+                        target._report_combined_unloading_cells = {
+                            **(existing if isinstance(existing, dict) else {}),
+                            source: source_cells.get(source, combined_cell),
+                        }
+                # Submit All writes an auxiliary unloading row for each added
+                # source lot.  That row records its Jig Unloading history,
+                # but it does not create a separate Nickel Wiping lot: the
+                # primary combined transfer is the only downstream lot.
+                primary_source = str(source_metadata.get('primary_lot_id') or '')
+                for source in quantities:
+                    if (source != primary_source and source in unload_by_lot
+                            and unload_by_lot[source] is not unload):
+                        unload_by_lot[source]._report_combined_secondary = True
+                        unload_by_lot[source]._report_combined_transfer = (unload, primary_source)
+                break
 
     tz_aware = timezone.is_aware(timezone.now())
 
@@ -1320,7 +2081,13 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
             'remarks': batch.dp_pick_remarks or '', '_activity': activity,
         }
     for stock in stocks:
-        batch = stock.batch_id
+        if str(stock.lot_id) in balance_child_ids:
+            continue
+        # Jig Loading remainder rows inherit the primary jig batch in their
+        # stock record. Their persisted tray source is the truthful model for
+        # filtering and report display.
+        batch = source_batch_objects.get(split_batches.get(stock.lot_id), stock.batch_id)
+        is_jig_split = stock.lot_id in split_quantities or stock.lot_id.startswith('EX-')
         stk_no = (batch.plating_stk_no or '').strip()
         if not stk_no:
             continue
@@ -1328,6 +2095,33 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
         jig_record = jig_by_lot.get(stock.lot_id)
         unload_record = unload_by_lot.get(stock.lot_id)
         stocks_for_batch = stocks_by_batch.get(stock.batch_id_id) or [stock]
+        loading_allocations = [
+            allocation for allocation in
+            (getattr(jig_record, 'multi_model_allocation', None) or [])
+            if isinstance(allocation, dict) and allocation.get('lot_id')
+        ]
+        loading_primary = next(
+            (allocation for allocation in loading_allocations
+             if allocation.get('role') == 'primary'),
+            loading_allocations[0] if loading_allocations else None,
+        )
+        # A lot added in Jig Loading remains a secondary source model. Its
+        # Nickel Wiping history belongs on the primary model's report row.
+        is_jig_loading_added_model = bool(
+            loading_primary
+            and len(loading_allocations) > 1
+            and str(stock.lot_id) != str(loading_primary.get('lot_id') or '')
+        )
+        # A direct Jig Loading lot is the primary model even when it has no
+        # multi-model allocation saved. Secondary summaries belong only on
+        # rows that do not have such a primary loading record.
+        has_jig_loading_primary_model = bool(
+            jig_record and (
+                not loading_allocations
+                or (loading_primary and
+                    str(stock.lot_id) == str(loading_primary.get('lot_id') or ''))
+            )
+        )
 
         dp_cell, dp_status = _day_planning_cell(batch, records.dp_batches.get(batch.pk))
 
@@ -1336,13 +2130,174 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
         )
         early_activity = running_out
         jig_cell, ip_cell, jig_status, ip_status, running_out = _jig_loading_cells(
-            jig_record, records=records, lot_id=stock.lot_id
+            jig_record, records=records, lot_id=stock.lot_id,
+            plating_stock_no=stk_no,
         )
+        balance_blocks = []
+        balance_ip_blocks = []
+        balance_jig_records = []
+        for balance in balance_descendants(stock.lot_id):
+            balance_jig = jig_by_lot.get(balance.new_lot_id)
+            if balance_jig:
+                balance_jig_records.append((balance, balance_jig))
+                balance_cell, balance_ip_cell, _, _, _ = _jig_loading_cells(
+                    balance_jig, records=records, lot_id=balance.new_lot_id,
+                    plating_stock_no=stk_no,
+                )
+                if 'Status : Not Reached' not in balance_ip_cell:
+                    balance_ip_blocks.append(balance_ip_cell)
+            else:
+                balance_entry = records.entry(STAGE_JIG_LOADING, balance.new_lot_id)
+                balance_cell = '\n'.join([
+                    f'IN : {_fmt((balance_entry or {}).get("in_time")) or "--"}',
+                    'OUT: --',
+                    f'Excess Lot Qty : {balance.lot_qty}',
+                    'Status : Yet to be Loaded',
+                ])
+            balance_blocks.append(balance_cell)
+        if balance_blocks:
+            jig_cell = '\n\n'.join([jig_cell, *balance_blocks])
+        if balance_ip_blocks:
+            # The original lot retains its earlier IP record and receives a
+            # second 98 record when its balance joins another primary model.
+            ip_cell = '\n\n'.join([ip_cell, *balance_ip_blocks])
         jig_activity = running_out
         late_cells, late_statuses, running_out = _late_module_cells(
             unload_record, zone_map, records=records, lot_id=stock.lot_id,
             plating_color_id=stock.plating_color_id, jig_record=jig_record
         )
+        for balance, balance_jig in balance_jig_records:
+            balance_late_cells, balance_late_statuses, balance_activity = _late_module_cells(
+                unload_by_lot.get(balance.new_lot_id), zone_map, records=records,
+                lot_id=balance.new_lot_id, plating_color_id=stock.plating_color_id,
+                jig_record=balance_jig,
+            )
+            # A remaining balance lot that becomes a secondary model keeps
+            # its Jig Unloading history only. Its Nickel Wiping flow belongs
+            # to the new primary model and must not be shown here. A separate
+            # small lot added as a model renders its own short summary below.
+            for name in ('Jig Unloading Z1', 'Jig Unloading Z2'):
+                balance_unloading = balance_late_cells[name]
+                if 'Status : Not Reached' in balance_unloading:
+                    continue
+                if 'Status : Not Reached' in late_cells[name]:
+                    late_cells[name] = balance_unloading
+                else:
+                    late_cells[name] += '\n\n' + balance_unloading
+                if balance_late_statuses[name] == 'In Progress':
+                    late_statuses[name] = 'In Progress'
+            balance_allocations = [
+                allocation for allocation in
+                (getattr(balance_jig, 'multi_model_allocation', None) or [])
+                if isinstance(allocation, dict) and allocation.get('lot_id')
+            ]
+            balance_primary = next(
+                (allocation for allocation in balance_allocations
+                 if allocation.get('role') == 'primary'),
+                balance_allocations[0] if balance_allocations else None,
+            )
+            balance_secondary = next(
+                (allocation for allocation in balance_allocations
+                 if str(allocation.get('lot_id') or '') == str(balance.new_lot_id)),
+                None,
+            )
+            if (
+                not has_jig_loading_primary_model
+                and balance_primary
+                and balance_secondary
+                and str(balance_primary.get('lot_id') or '') != str(balance.new_lot_id)
+            ):
+                secondary_qty = balance_secondary.get(
+                    'allocated_qty', balance_secondary.get(
+                        'requested_qty', balance_secondary.get('model_lot_qty', balance.lot_qty)
+                    )
+                )
+                primary_qty = balance_primary.get(
+                    'allocated_qty', balance_primary.get(
+                        'requested_qty', balance_primary.get('model_lot_qty', '--')
+                    )
+                )
+                primary_model = (
+                    balance_primary.get('model')
+                    or balance_primary.get('model_no')
+                    or stk_no
+                )
+                balance_zone = zone_map.get(
+                    (unload_by_lot.get(balance.new_lot_id).plating_color_id
+                     if unload_by_lot.get(balance.new_lot_id) else stock.plating_color_id)
+                )
+                if balance_zone:
+                    name = f'Nickel Wiping {balance_zone.upper()}'
+                    balance_wiping = '\n'.join([
+                        f'PLATING STK NO : {stk_no}',
+                        f'Lot Qty : {secondary_qty}',
+                        'Note : Added with Primary Model : '
+                        f'{primary_model}; Lot Qty : {primary_qty}',
+                    ])
+                    if 'Status : Not Reached' in late_cells[name]:
+                        late_cells[name] = balance_wiping
+                    else:
+                        late_cells[name] += '\n\n' + balance_wiping
+            running_out = _latest_time(running_out, balance_activity)
+        combined_transfer = getattr(unload_record, '_report_combined_transfer', None)
+        if combined_transfer and not is_jig_loading_added_model:
+            primary_unload, primary_source = combined_transfer
+            shared_cells, shared_statuses, shared_activity = _late_module_cells(
+                primary_unload, zone_map, records=records, lot_id=primary_source,
+                plating_color_id=stock.plating_color_id,
+                jig_record=jig_by_lot.get(primary_source),
+            )
+            # Jig Unloading remains source-specific: an added 4-qty lot must
+            # not be replaced with its 140-qty primary lot.  Only downstream
+            # Nickel stages describe the shared combined transfer.
+            for name in ('Nickel Wiping Z1', 'Nickel Wiping Z2',
+                         'Nickel Audit Z1', 'Nickel Audit Z2'):
+                late_cells[name] = shared_cells[name]
+                late_statuses[name] = shared_statuses[name]
+            running_out = _latest_time(running_out, shared_activity)
+        elif is_jig_loading_added_model:
+            # A secondary Jig Loading model records only its own handoff to
+            # Nickel Wiping. The physical wiping transaction belongs to its
+            # primary model, so do not copy the combined quantity, Wiping
+            # history, or any later Nickel Audit transaction to this row.
+            secondary_loading = next(
+                (allocation for allocation in loading_allocations
+                 if str(allocation.get('lot_id') or '') == str(stock.lot_id)),
+                {},
+            )
+            secondary_qty = secondary_loading.get(
+                'allocated_qty', secondary_loading.get(
+                    'requested_qty', secondary_loading.get('model_lot_qty', stock.total_stock)
+                )
+            )
+            primary_qty = loading_primary.get(
+                'allocated_qty', loading_primary.get(
+                    'requested_qty', loading_primary.get('model_lot_qty', '--')
+                )
+            )
+            primary_model = (
+                loading_primary.get('model')
+                or loading_primary.get('model_no')
+                or stk_no
+            )
+            secondary_wiping = '\n'.join([
+                f'PLATING STK NO : {stk_no}',
+                f'Lot Qty : {secondary_qty}',
+                'Note : Added with Primary Model : '
+                f'{primary_model}; Lot Qty : {primary_qty}',
+            ])
+            secondary_zone = zone_map.get(
+                unload_record.plating_color_id if unload_record else stock.plating_color_id
+            )
+            if secondary_zone:
+                name = f'Nickel Wiping {secondary_zone.upper()}'
+                late_cells[name] = secondary_wiping
+                # Keep the green completed state without adding a Status line
+                # to the displayed secondary-model summary.
+                late_statuses[name] = 'Completed'
+            for name in ('Nickel Audit Z1', 'Nickel Audit Z2'):
+                late_cells[name] = _module_cell('Not Reached')
+                late_statuses[name] = 'Not Reached'
 
         modules = {STAGE_DAY_PLANNING: dp_cell}
         modules.update(early_cells)
@@ -1350,13 +2305,53 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
         modules[STAGE_IP_INSPECTION] = ip_cell
         modules.update(late_cells)
 
+        # Keep each saved remark beside the transaction it belongs to.
+        modules[STAGE_DAY_PLANNING] = _append_module_remarks(
+            modules[STAGE_DAY_PLANNING], batch.dp_pick_remarks)
+        modules[STAGE_INPUT_SCREENING] = _append_module_remarks(
+            modules[STAGE_INPUT_SCREENING], stock.IP_pick_remarks)
+        modules[STAGE_BRASS_QC] = _append_module_remarks(
+            modules[STAGE_BRASS_QC], stock.Bq_pick_remarks)
+        modules[STAGE_IQF] = _append_module_remarks(
+            modules[STAGE_IQF], stock.IQF_pick_remarks)
+        modules[STAGE_BRASS_AUDIT] = _append_module_remarks(
+            modules[STAGE_BRASS_AUDIT], stock.BA_pick_remarks,
+            *(records.ba_rejection_remarks.get(candidate.lot_id)
+              for candidate in stocks_for_batch))
+        modules[STAGE_JIG_LOADING] = _append_module_remarks(
+            modules[STAGE_JIG_LOADING],
+            getattr(jig_record, 'pick_remarks', None) if jig_record else None,
+            getattr(jig_record, 'unloading_remarks', None) if jig_record else None,
+            getattr(jig_record, 'remarks', None) if jig_record else None)
+        report_zone = zone_map.get(
+            unload_record.plating_color_id if unload_record else stock.plating_color_id)
+        if unload_record and report_zone:
+            modules[f'Nickel Wiping {report_zone.upper()}'] = _append_module_remarks(
+                modules[f'Nickel Wiping {report_zone.upper()}'],
+                unload_record.nq_pick_remarks)
+            modules[f'Nickel Audit {report_zone.upper()}'] = _append_module_remarks(
+                modules[f'Nickel Audit {report_zone.upper()}'],
+                unload_record.na_pick_remarks)
+
         statuses = {STAGE_DAY_PLANNING: dp_status}
         statuses.update(early_statuses)
         statuses[STAGE_JIG_LOADING] = jig_status
         statuses[STAGE_IP_INSPECTION] = ip_status
         statuses.update(late_statuses)
+        if is_jig_split:
+            # This lot starts at Jig Loading; earlier history belongs to its
+            # parent batch and must not be repeated as this lot's processing.
+            for name in MODULE_COLUMNS[:5]:
+                modules[name] = _module_cell('Not Applicable')
+                statuses[name] = 'Not Applicable'
         _apply_route_applicability(modules, statuses, zone_map.get(
             unload_record.plating_color_id if unload_record else stock.plating_color_id))
+        # Keep the stock identifier visible at the top of every process
+        # module.  Several specialized multi-model cells already include it,
+        # so do not add a duplicate line.
+        for name, cell in modules.items():
+            if 'PLATING STK NO :' not in (cell or '').upper():
+                modules[name] = f'PLATING STK NO : {stk_no or "--"}\n{cell}'
         module_states = {name: _stage_state(status) for name, status in statuses.items()}
         module_details = {name: _parse_cell_lines(text) for name, text in modules.items()}
 
@@ -1369,21 +2364,14 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
         if to_dt_val and activity and activity > to_dt_val:
             continue
 
-        remarks = _first_remark(
-            getattr(unload_record, 'spider_pick_remarks', None) if unload_record else None,
-            getattr(unload_record, 'na_pick_remarks', None) if unload_record else None,
-            getattr(unload_record, 'nq_pick_remarks', None) if unload_record else None,
-            getattr(jig_record, 'unloading_remarks', None) if jig_record else None,
-            getattr(jig_record, 'pick_remarks', None) if jig_record else None,
-            getattr(jig_record, 'remarks', None) if jig_record else None,
-            stock.BA_pick_remarks, stock.IQF_pick_remarks,
-            stock.Bq_pick_remarks, stock.IP_pick_remarks,
-            batch.dp_pick_remarks,
-        )
+        # Module remarks are displayed in their own module cells. Keep this
+        # column blank while retaining it in the report layout.
+        remarks = ''
 
         row = {
             'plating_stk_no': stk_no,
-            'lot_qty': int(batch.total_batch_quantity or 0),
+            'lot_qty': int(split_quantities.get(stock.lot_id, stock.total_stock) or 0)
+                       if is_jig_split else int(batch.total_batch_quantity or 0),
             'modules': modules,
             'module_states': module_states,
             'module_details': module_details,
@@ -1398,11 +2386,18 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
             if module_states[name] in (STATE_CURRENT, STATE_COMPLETED)
         }
 
-        lot_key = ('batch', batch.pk)
+        # Render a known remainder as another block in its source lot's row.
+        # Unresolved mixed-source leftovers must not inherit the primary model.
+        lot_key = (('batch', split_batches[stock.lot_id])
+                   if stock.lot_id in split_batches else
+                   ('jig_split', stock.lot_id) if is_jig_split else ('batch', batch.pk))
         existing = rows_by_lot.get(lot_key)
         if existing is None:
             rows_by_lot[lot_key] = row
         else:
+            if not is_jig_split:
+                existing['plating_stk_no'] = row['plating_stk_no']
+                existing['lot_qty'] = row['lot_qty']
             # Split children share an upstream journey but may reach different
             # downstream stages. Retain actual evidence from both branches.
             newer = bool(row['_activity'] and (
@@ -1418,8 +2413,10 @@ def get_consolidated_report_rows(date_from=None, date_to=None, plating_stock_no=
                     for field in ('modules', 'module_states', 'module_details'):
                         existing[field][name] = row[field][name]
             existing['_activity'] = _latest_time(existing['_activity'], row['_activity'])
-            if newer and row['remarks']:
-                existing['remarks'] = row['remarks']
+            if row['remarks']:
+                existing['remarks'] = _combined_remarks(
+                    ('', existing['remarks']), ('', row['remarks'])
+                )
 
     sentinel = datetime.min
     if tz_aware:

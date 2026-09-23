@@ -42,6 +42,7 @@ def _mark_lot_submitted_flags(lot_id: str, accepted_qty: int = 0) -> None:
     TotalStockModel.objects.filter(lot_id=lot_id).update(
         rejected_ip_stock=False,
         few_cases_accepted_Ip_stock=True,
+        accepted_tray_scan_status=True,
         total_IP_accpeted_quantity=accepted_qty,
         last_process_module="Input Screening",
         next_process_module="Brass QC",

@@ -1613,6 +1613,8 @@ body.add-model-mode #selectAllCheckbox {
                       data-lot-id="{{ jig_detail.lot_id }}" 
                       data-lot-id-quantities='{{ jig_detail.lot_id_quantities|json_encode }}' 
                       data-lot-id-model-map='{{ jig_detail.lot_id_model_map|json_encode }}'
+                      data-add-model-lot-quantities='{{ jig_detail.add_model_lot_quantities|json_encode }}'
+                      data-add-model-lot-model-map='{{ jig_detail.add_model_lot_model_map|json_encode }}'
                       data-has-draft="{{ jig_detail.has_unload_draft|yesno:'true,false' }}"
                       data-already-loaded="{{ jig_detail.is_already_loaded_z1|yesno:'true,false' }}">
                                       
@@ -3365,8 +3367,10 @@ document.addEventListener('DOMContentLoaded', function() {
       // so the preview here always matches what get_unload_models_z1 merges.
       let totalQty = 0;
       try {
-        const lotQtys = JSON.parse(row.dataset.lotIdQuantities || '{}');
-        const lotModelMap = JSON.parse(row.dataset.lotIdModelMap || '{}');
+        // Add Model uses its own per-source-lot allocation map. The main-table
+        // lot_id_quantities remains unchanged so Lot Qty still renders as one total.
+        const lotQtys = JSON.parse(row.dataset.addModelLotQuantities || row.dataset.lotIdQuantities || '{}');
+        const lotModelMap = JSON.parse(row.dataset.addModelLotModelMap || row.dataset.lotIdModelMap || '{}');
         const hasModelMap = Object.keys(lotModelMap).length > 0;
         Object.keys(lotQtys).forEach(function(lotId) {
           if (hasModelMap && lotModelMap[lotId] !== currentModel) return;
