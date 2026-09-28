@@ -692,8 +692,8 @@ body.add-model-mode #selectAllCheckbox {
             border-radius: 12px;
             box-shadow: 0 20px 60px rgba(0,0,0,0.25);
             width: fit-content;
-            min-width: 220px;
-            max-width: min(720px, 96vw);
+            min-width: 320px;
+            max-width: 96vw;
             max-height: 88vh;
             padding: 24px 28px 20px;
             overflow-y: auto;
@@ -714,11 +714,11 @@ body.add-model-mode #selectAllCheckbox {
         #modelRemarkModalContent {
             display: flex;
             flex-direction: row;
-            justify-content: flex-start;
-            gap: 18px;
+            justify-content: center;
+            gap: 20px;
             overflow-x: auto;
             overflow-y: hidden;
-            padding-bottom: 10px;
+            padding: 4px 4px 12px;
         }
 
         #modelRemarkModalContent::-webkit-scrollbar {
@@ -747,7 +747,7 @@ body.add-model-mode #selectAllCheckbox {
         }
 
         #modelRemarkModal .gallery-card {
-            flex: 0 0 200px;
+            flex: 0 0 260px;
             border: 1px solid #e5e7eb;
             border-radius: 10px;
             overflow: hidden;
@@ -759,13 +759,33 @@ body.add-model-mode #selectAllCheckbox {
 
         #modelRemarkModal .gallery-card-header {
             background: #f5f7f8;
-            padding: 8px 10px;
-            text-align: center;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 14px;
+            padding: 10px 12px;
+            text-align: left;
             border-bottom: 1px solid #eee;
             font-weight: 600;
             font-size: 13px;
             color: #00695c;
-            word-break: break-all;
+        }
+
+        #modelRemarkModal .gallery-card-model-label {
+            min-width: 0;
+            overflow-wrap: anywhere;
+        }
+
+        #modelRemarkModal .jig-model-info-btn {
+            flex: 0 0 auto;
+            background: #007bff;
+            color: #fff;
+            border: none;
+            border-radius: 4px;
+            padding: 4px 10px;
+            font-size: 12px;
+            line-height: 1.25;
+            cursor: pointer;
         }
 
         #modelRemarkModal .gallery-card-color {
@@ -779,10 +799,21 @@ body.add-model-mode #selectAllCheckbox {
         }
 
         #modelRemarkModal .gallery-card-body {
-            padding: 10px;
+            min-height: 190px;
+            padding: 16px;
             display: flex;
             align-items: center;
             justify-content: center;
+        }
+
+        #modelRemarkModal .jig-gallery-preview-loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            min-height: 160px;
+            color: #6b7280;
+            font-size: 12px;
         }
 
         #modelRemarkModal .gallery-empty {
@@ -793,7 +824,7 @@ body.add-model-mode #selectAllCheckbox {
 
         #modelRemarkModal img {
             width: 100%;
-            height: 130px;
+            height: 160px;
             object-fit: contain;
             border-radius: 6px;
             border: 1px solid #eee;
@@ -848,7 +879,7 @@ body.add-model-mode #selectAllCheckbox {
             }
 
             #modelRemarkModal .gallery-dialog {
-                width: fit-content;
+                width: 100%;
                 min-width: 0;
                 max-width: 96vw;
                 max-height: 92vh;
@@ -861,11 +892,11 @@ body.add-model-mode #selectAllCheckbox {
             }
 
             #modelRemarkModal .gallery-card {
-                flex: 0 0 150px;
+                flex: 0 0 min(260px, calc(96vw - 56px));
             }
 
             #modelRemarkModal img {
-                height: 100px;
+                height: 140px;
             }
 
             #modelRemarkModal .model-no {
@@ -3576,6 +3607,7 @@ document.addEventListener('DOMContentLoaded', function() {
   }
 
   const jigGalleryPreviewImageCache = {};
+  let jigGalleryPreviewRequestId = 0;
 
   function normalizeJigGalleryImageUrl(rawUrl) {
     const value = String(rawUrl || '').trim();
@@ -3636,16 +3668,37 @@ document.addEventListener('DOMContentLoaded', function() {
       });
   }
 
-  function hydrateJigGalleryPreviewImages(root) {
+  function hydrateJigGalleryPreviewImages(root, requestId) {
     if (!root) return;
     root.querySelectorAll('.jig-gallery-preview-img[data-model-no]').forEach(function(img) {
       const modelNo = img.getAttribute('data-model-no') || '';
+      const loading = img.parentElement.querySelector('.jig-gallery-preview-loading');
+      img.removeAttribute('src');
+      img.style.display = 'none';
       fetchJigGalleryPreviewImage(modelNo).then(function(previewUrl) {
-        if (!previewUrl) return;
-        img.src = previewUrl;
-        img.onclick = function() {
-          displayEnlargedImage(previewUrl, modelNo);
+        const isCurrentSelection = function() {
+          return requestId === jigGalleryPreviewRequestId && root.isConnected && img.isConnected;
         };
+        if (!isCurrentSelection()) return;
+        if (!previewUrl) {
+          if (loading) loading.textContent = 'No image available';
+          return;
+        }
+
+        const preloader = new Image();
+        preloader.onload = function() {
+          if (!isCurrentSelection()) return;
+          img.src = previewUrl;
+          img.style.display = 'block';
+          if (loading) loading.style.display = 'none';
+          img.onclick = function() {
+            displayEnlargedImage(previewUrl, modelNo);
+          };
+        };
+        preloader.onerror = function() {
+          if (isCurrentSelection() && loading) loading.textContent = 'Image unavailable';
+        };
+        preloader.src = previewUrl;
       });
     });
   }
@@ -3934,6 +3987,15 @@ document.addEventListener('DOMContentLoaded', function() {
         return;
       }
       
+      const modal = document.getElementById('modelRemarkModal');
+      const content = document.getElementById('modelRemarkModalContent');
+      const requestId = ++jigGalleryPreviewRequestId;
+      if (modal && content) {
+        // Reset the prior selection before any new preview request starts.
+        content.innerHTML = '<div class="jig-gallery-preview-loading"><i class="fa fa-spinner fa-spin"></i> Loading model images...</div>';
+        modal.style.display = 'flex';
+      }
+
       const modelList = JSON.parse(tdElement.getAttribute('data-model-list') || '[]');
       const modelImages = JSON.parse(tdElement.getAttribute('data-images') || '{}');
       const modelColors = JSON.parse(tdElement.getAttribute('data-model-colors') || '{}');
@@ -3945,42 +4007,40 @@ document.addEventListener('DOMContentLoaded', function() {
       let galleryHTML = '';
 
       modelList.forEach(function(modelNo) {
-        const images = modelImages[modelNo] || [];
         const rawColor = modelColors[modelNo];
         const color = (rawColor && /^#[0-9a-f]{3,8}$/i.test(rawColor)) ? rawColor : '#6c757d';
 
         galleryHTML += '<div class="gallery-card">';
-        galleryHTML += '<div class="gallery-card-header"><span class="gallery-card-color" style="background:' + color + ';"></span>Model: ' + escHtml(modelNo) + '</div>';
+        galleryHTML += '<div class="gallery-card-header"><span class="gallery-card-model-label"><span class="gallery-card-color" style="background:' + color + ';"></span>Model: ' + escHtml(modelNo) + '</span><button type="button" class="jig-model-info-btn" data-plating-stk-no="' + escHtml(modelNo) + '">Info</button></div>';
 
-        const fallbackImageUrl = normalizeJigGalleryImageUrl(images && images.length ? images[0] : '') || '/static/assets/images/imagePlaceholder.jpg';
-        if (fallbackImageUrl) {
-          galleryHTML += '<div class="gallery-card-body">';
-          galleryHTML += '<img src="' + escHtml(fallbackImageUrl) + '" ';
-          galleryHTML += 'class="jig-gallery-preview-img" data-model-no="' + escHtml(modelNo) + '" ';
-          galleryHTML += 'alt="Model ' + escHtml(modelNo) + ' - IV image" ';
-          galleryHTML += 'title="Click to enlarge" ';
-          galleryHTML += 'onclick="displayEnlargedImage(\'' + escHtml(fallbackImageUrl) + '\', \'' + escHtml(modelNo) + '\')" />';
-          galleryHTML += '</div>';
-        } else {
-          galleryHTML += '<div class="gallery-empty">';
-          galleryHTML += '<i class="fa fa-image" style="font-size:24px; margin-bottom:8px;"></i>';
-          galleryHTML += '<p style="margin:0;">No images available</p>';
-          galleryHTML += '</div>';
-        }
+        galleryHTML += '<div class="gallery-card-body"><div class="jig-gallery-preview-loading"><i class="fa fa-spinner fa-spin"></i> Loading image...</div>';
+        galleryHTML += '<img class="jig-gallery-preview-img" data-model-no="' + escHtml(modelNo) + '" alt="Model ' + escHtml(modelNo) + ' - IV image" style="display:none;" />';
+        galleryHTML += '</div>';
 
         galleryHTML += '</div>';
       });
 
       // Display in modal
-      const modal = document.getElementById('modelRemarkModal');
-      const content = document.getElementById('modelRemarkModalContent');
       if (modal && content) {
         console.log('[Z2 Gallery] Opening modal with gallery HTML');
         content.innerHTML = galleryHTML;
-        hydrateJigGalleryPreviewImages(content);
+        hydrateJigGalleryPreviewImages(content, requestId);
         modal.style.display = 'flex';
       } else {
         console.error('[Z2 Gallery] Modal elements not found:', { modal: !!modal, content: !!content });
+      }
+    });
+
+    // Reuse the existing Visual Aid model-detail page used by Nickel Wiping.
+    document.addEventListener('click', function(e) {
+      const infoButton = e.target.closest('.jig-model-info-btn');
+      if (!infoButton) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+      const platingStockNo = (infoButton.getAttribute('data-plating-stk-no') || '').trim();
+      if (platingStockNo) {
+        window.location.href = '/adminportal/dp_visualaid/?plating_stk_no=' + encodeURIComponent(platingStockNo) + '&preview=iv';
       }
     });
     

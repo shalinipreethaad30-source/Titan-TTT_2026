@@ -211,6 +211,40 @@ def get_iqf_picktable_base_queryset():
 # Single lot lookup
 # ─────────────────────────────────────────────────────────────────────────────
 
+def is_current_iqf_scan_tray(tray_id, lot_id):
+    """Validate exact current physical-tray ownership for F2, without history fallback."""
+    from ..models import IQFTrayId
+
+    tray_id = str(tray_id or '').strip()
+    if not tray_id:
+        return False
+
+    # Resolve the latest assignment BEFORE checking flags: a released newer
+    # row must not resurrect an older active-looking row for the same tray.
+    tray = IQFTrayId.objects.filter(tray_id__iexact=tray_id).order_by(
+        '-date', '-pk',
+    ).values('lot_id', 'delink_tray', 'rejected_tray', 'tray_quantity', 'remaining_qty').first()
+    if (not tray or tray['lot_id'] != lot_id or tray['delink_tray']
+            or tray['rejected_tray']
+            or (tray['remaining_qty'] or tray['tray_quantity'] or 0) <= 0):
+        return False
+
+    # Match IQFPickTableView's movement/completion scope without changing it.
+    return TotalStockModel.objects.filter(
+        lot_id=lot_id,
+        batch_id__total_batch_quantity__gt=0,
+    ).filter(
+        Q(send_brass_audit_to_iqf=True)
+        | Q(brass_qc_rejection=True, last_process_module='Brass QC')
+    ).exclude(
+        Q(brass_audit_accptance=True, send_brass_audit_to_iqf=False)
+        | Q(iqf_acceptance=True) | Q(iqf_rejection=True)
+        | Q(send_brass_audit_to_iqf=True, brass_audit_onhold_picking=True)
+        | Q(iqf_few_cases_acceptance=True, iqf_onhold_picking=False)
+        | Q(is_split=True) | Q(remove_lot=True)
+    ).filter(brass_qc_transition_reject_lot_id__isnull=True).exists()
+
+
 def get_lot(lot_id):
     """
     Returns TotalStockModel for the given lot_id.

@@ -4048,9 +4048,13 @@
 
   function rowMatchesContext(row, context) {
     if (!row || !context || !context.identifiers || !context.identifiers.length) return false;
-    // An excess lot shares its batch with the submitted parent and possibly
-    // other excess cycles. Only its exact lot row is the scan destination.
-    if (context.responseData && context.responseData.source === 'JigLoadingExcess') {
+    // IQF, Nickel Wiping, and excess lots can share a batch with other lots.
+    // The API's exact lot is the scan destination; never fall back to a
+    // sibling's batch when choosing the row to scroll to and highlight.
+    if (context.responseData && (context.responseData.source === 'JigLoadingExcess' ||
+        context.responseData.module === 'IQF' ||
+        context.responseData.module === 'Nickel Wiping' ||
+        context.responseData.module === 'Nickel Wiping Z2')) {
       return normalizeIdentifier(row.getAttribute('data-stock-lot-id') || row.getAttribute('data-lot-id')) ===
         normalizeIdentifier(context.responseData.lot_id);
     }
@@ -4638,10 +4642,11 @@
     clearScanHighlights();
     restorePrioritizedRow();
     scanInput.disabled = false;
-    setInfo('!', 'Not Exists', '#dc3545');
-    setScanMessage('Not Exists', '#dc3545');
+    const message = /^\/iqf\//i.test(window.location.pathname) ? 'Tray ID does not exist' : 'Not Exists';
+    setInfo('!', message, '#dc3545');
+    setScanMessage(message, '#dc3545');
     if (scanResult) {
-      scanResult.innerHTML = '<div style="color:#dc3545;font-weight:700;padding:6px 0;">Not Exists</div>';
+      scanResult.innerHTML = '<div style="color:#dc3545;font-weight:700;padding:6px 0;">' + message + '</div>';
     }
     focusScanInput(true);
     dispatchGlobalScanEvent('globalScan:notFound', { tray_id: trayId });
@@ -5314,6 +5319,10 @@
         }
       }
       console.log('[AUTO-HL] ✗ Lot ID not found in any rows');
+
+      // The server supplied an exact destination lot. Do not highlight a
+      // different row merely because it shares the batch or tray history.
+      return null;
     }
 
     // SECONDARY: Search by batch_id — some tables (e.g. DP Completed Table)
@@ -5362,10 +5371,13 @@
 
   // ── Highlight and scroll (sticky-header aware) ────────────────────────────
   function highlightRow(row) {
-    if (row && row.parentNode && row.parentNode.firstElementChild !== row) {
-      row.parentNode.insertBefore(row, row.parentNode.firstElementChild);
-    }
-    row.classList.add('gs-hi');
+    highlightFinished = true;
+    if (highlightObserver) highlightObserver.disconnect();
+    // Use the same marker/classes as a successful scan on the current page.
+    // This keeps cross-module navigation highlights visible in every Pick
+    // Table, including pages with module-specific row styles.
+    row.classList.add('gs-hi', 'gs-active-scan', 'gkb-row-focus', 'dp-row-action-highlight');
+    row.setAttribute('data-global-scan-active', '1');
     const pg = getCurrentPage();
     
     // Show success with full context for valid scans
@@ -5383,7 +5395,8 @@
     window.scrollTo({ top: window.scrollY + rect.top - navH - 80, behavior: 'smooth' });
 
     setTimeout(() => {
-      row.classList.remove('gs-hi');
+      row.classList.remove('gs-hi', 'gs-active-scan', 'gkb-row-focus', 'dp-row-action-highlight');
+      row.removeAttribute('data-global-scan-active');
       window.history.replaceState({}, document.title, window.location.pathname);
       setInfo('📡', window.getGlobalScanPromptText ? window.getGlobalScanPromptText() : 'Scan ready', '#025254');
     }, 12000);
@@ -5422,17 +5435,36 @@
   // ── Main hunt loop ────────────────────────────────────────────────────────
   let huntPage = 1;
   let huntTimer = null;
+  let renderWaitAttempts = 0;
+  let highlightObserver = null;
+  let highlightFinished = false;
   const MAX_PAGES = 30;
 
+  function finishHunt() {
+    highlightFinished = true;
+    if (highlightObserver) highlightObserver.disconnect();
+  }
+
   function hunt() {
+    if (highlightFinished) return;
     const row = findRow();
     if (row) { highlightRow(row); return; }
+
+    // Several Pick Tables populate their rows asynchronously. Wait for the
+    // initial render before attempting pagination; otherwise F2 can finish
+    // its search before the exact destination row exists in the DOM.
+    if (!document.querySelector('table tbody tr') && renderWaitAttempts < 12) {
+      renderWaitAttempts++;
+      huntTimer = setTimeout(hunt, 300);
+      return;
+    }
 
     if (huntPage >= MAX_PAGES) {
       // For valid global scans, don't show error - the green banner will show valid info
       if (!isValidScan) {
         setInfo('⚠️', scanTrayId + ' — row not found', '#dc3545');
       }
+      finishHunt();
       window.history.replaceState({}, document.title, window.location.pathname);
       return;
     }
@@ -5450,6 +5482,7 @@
       if (!isValidScan) {
         setInfo('⚠️', scanTrayId + ' — row not found', '#dc3545');
       }
+      finishHunt();
       return;
     }
     // DataTables not present — try generic
@@ -5458,21 +5491,35 @@
       if (!isValidScan) {
         setInfo('⚠️', scanTrayId + ' — row not found', '#dc3545');
       }
+      finishHunt();
     }
     // else MutationObserver fires
   }
 
   // ── Watch for AJAX pagination DOM changes ────────────────────────────────
-  const watchTarget = document.querySelector('#order-listing_wrapper, .dataTables_wrapper, .table-responsive, table');
-  if (watchTarget) {
-    new MutationObserver(() => {
+  if (document.body) {
+    highlightObserver = new MutationObserver(() => {
+      if (highlightFinished) return;
       clearTimeout(huntTimer);
       huntTimer = setTimeout(hunt, 350);
-    }).observe(watchTarget.closest('[id]') || watchTarget, { childList: true, subtree: true });
+    });
+    highlightObserver.observe(document.body, { childList: true, subtree: true });
   }
 
   // ── Initial search after page load ───────────────────────────────────────
   huntTimer = setTimeout(hunt, 800);
+
+  // Some Pick Tables finish their own JavaScript rendering after the initial
+  // navigation-time hunt. Re-run the same exact-lot search once the page is
+  // fully loaded so users do not need to refresh manually.
+  window.addEventListener('load', function() {
+    window.setTimeout(function() {
+      if (document.querySelector('tr[data-global-scan-active="1"]')) return;
+      highlightFinished = false;
+      renderWaitAttempts = 0;
+      hunt();
+    }, 350);
+  }, { once: true });
   
   // Clean up sessionStorage after navigation cycle completes
   setTimeout(() => {

@@ -6586,10 +6586,15 @@ document.addEventListener('DOMContentLoaded', function() {
       return;
     }
     
-    // Give the row highlight and move-to-top animation time to complete
+    const lotId = String(detail.lot_id || '').trim();
+    if (!lotId) return;
+
+    // Open only the API-resolved lot; table order and old highlights are irrelevant.
     setTimeout(function() {
-      // Find the highlighted row (should be at the top now)
-      const highlightedRow = document.querySelector('tbody tr.dp-row-action-highlight, tbody tr.gkb-row-focus, tbody tr:first-child');
+      const highlightedRow = Array.from(document.querySelectorAll('#order-listing tbody tr[data-stock-lot-id]'))
+        .find(function(row) {
+          return row.getAttribute('data-stock-lot-id') === lotId;
+        });
       
       if (!highlightedRow) {
         console.log('[IQF] No highlighted row found after scan');

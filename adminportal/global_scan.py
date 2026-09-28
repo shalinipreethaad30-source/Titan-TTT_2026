@@ -20,7 +20,7 @@ from django.contrib.auth.mixins import LoginRequiredMixin
 from django.http import JsonResponse
 from django.urls import reverse
 from django.views import View
-from django.db.models import Q
+from django.db.models import F, Q
 
 from adminportal.middleware import _MODULE_URL_MAP
 from adminportal.services import get_user_allowed_module_names, is_admin_user
@@ -191,7 +191,9 @@ class GlobalTraySearchView(LoginRequiredMixin, View):
             'success': False,
             'found': False,
             'tray_id': tray_id,
-            'message': 'Not Exists'
+            'message': ('Tray ID does not exist'
+                        if self._normalize_path(current_path).startswith('/iqf/')
+                        else 'Not Exists')
         })
 
 
@@ -306,6 +308,119 @@ class GlobalTraySearchView(LoginRequiredMixin, View):
             ).exclude(lot_id='').only('lot_id')
         )
         return lot_ids, batch_ids
+
+    def _resolve_active_nickel_wiping_lot_ids(self, tray_id):
+        """Return lots explicitly linked to a Nickel Wiping tray identifier.
+
+        Nickel Wiping keeps its tray rows after the normal physical-tray
+        lifecycle releases the tray for reuse.  It must therefore not share
+        the pre-Nickel ``delink_tray=False`` rule used by
+        :meth:`_resolve_active_tray_lot_ids`.  Current Nickel rows may also
+        retain their source trays only in the Jig Unloading submission
+        snapshot, so both sources are read with exact tray matching.  Callers
+        still use the Nickel Wiping pick-table query to decide whether each
+        discovered lot is currently active.
+        """
+        from Nickel_Inspection.models import NickelQcTrayId
+
+        tray_query = self._tray_query(self._tray_id_variants(tray_id))
+        lot_ids = []
+        seen_lot_ids = set()
+
+        def add_lot_id(lot_id):
+            normalized_lot_id = str(lot_id or '').strip()
+            if normalized_lot_id and normalized_lot_id not in seen_lot_ids:
+                seen_lot_ids.add(normalized_lot_id)
+                lot_ids.append(normalized_lot_id)
+        rows = (
+            NickelQcTrayId.objects.filter(tray_query, lot_id__isnull=False)
+            .exclude(lot_id='')
+            .order_by('-date', '-pk')
+            .values_list('lot_id', flat=True)
+        )
+        for lot_id in rows:
+            add_lot_id(lot_id)
+
+        # Zone 1 and Zone 2 Nickel Wiping can display original tray IDs from
+        # the final Jig Unloading submission rather than NickelQcTrayId. Map
+        # the exact matching source lot to its generated unload lot, which is
+        # the row key used by the Nickel pick tables.
+        try:
+            from Jig_Unloading.models import JigUnloadAfterTable, JUSubmittedZ1
+
+            tray_variants = self._tray_id_variants(tray_id)
+            submissions = (
+                JUSubmittedZ1.objects.filter(is_draft=False)
+                .exclude(tray_data__isnull=True)
+                .only('lot_id', 'tray_data', 'updated_at')
+                .order_by('-updated_at', '-pk')
+            )
+            for submission in submissions.iterator():
+                if not self._tray_id_in_payload(submission.tray_data, tray_variants):
+                    continue
+                source_lot_id = str(submission.lot_id or '').strip()
+                if not source_lot_id:
+                    continue
+                unload_lot_ids = JigUnloadAfterTable.objects.filter(
+                    combine_lot_ids__contains=[source_lot_id],
+                ).order_by('-created_at', '-pk').values_list('lot_id', flat=True)
+                for unload_lot_id in unload_lot_ids:
+                    add_lot_id(unload_lot_id)
+        except Exception as e:
+            logger.debug('%s Nickel Wiping submission-tray probe failed: %s', SCAN_TAG, e)
+        return lot_ids
+
+    def _resolve_active_brass_audit_lot_ids(self, tray_id):
+        """Return current Brass Audit pick-table lots containing this tray.
+
+        Brass Audit presents tray data through ``_resolve_lot_trays_audit``.
+        That resolver can legitimately use a Brass QC submission snapshot after
+        its physical tray rows have been delinked for reuse.  Use the same
+        resolver here, but only for the current Brass Audit Pick Table lots,
+        so F2 neither misses visible trays nor revives historical rows.
+        """
+        from BrassAudit.selectors import get_picktable_base_queryset
+        from BrassAudit.views import _resolve_lot_trays_audit
+
+        tray_variants = self._tray_id_variants(tray_id)
+        lot_ids = []
+        for lot_id in get_picktable_base_queryset().values_list('lot_id', flat=True):
+            if not lot_id:
+                continue
+            tray_data, _, _ = _resolve_lot_trays_audit(lot_id)
+            if self._tray_id_in_payload(tray_data, tray_variants):
+                lot_ids.append(str(lot_id))
+        return lot_ids
+
+    def _resolve_nickel_audit_lot_ids(self, tray_id, nickel_wiping_lot_ids=None):
+        """Return exact tray-linked candidates for the Nickel Audit pick tables.
+
+        Nickel Audit Zone 1 and Zone 2 keep separate tray models.  A Nickel
+        Audit row can also inherit a tray only through the preceding Nickel
+        Wiping lot, so include the already exact-resolved Nickel candidates.
+        The Nickel Audit pick-table checkers determine active ownership.
+        """
+        from Nickel_Audit.models import Nickel_AuditTrayId
+        from nickel_audit_zone_two.models import NickelQcTrayId as NickelAuditZ2TrayId
+
+        tray_query = self._tray_query(self._tray_id_variants(tray_id))
+        lot_ids = []
+        seen_lot_ids = set()
+        for tray_model in (Nickel_AuditTrayId, NickelAuditZ2TrayId):
+            for lot_id in tray_model.objects.filter(tray_query, lot_id__isnull=False).exclude(
+                lot_id=''
+            ).order_by('-date', '-pk').values_list('lot_id', flat=True):
+                normalized_lot_id = str(lot_id).strip()
+                if normalized_lot_id and normalized_lot_id not in seen_lot_ids:
+                    seen_lot_ids.add(normalized_lot_id)
+                    lot_ids.append(normalized_lot_id)
+
+        for lot_id in nickel_wiping_lot_ids or []:
+            normalized_lot_id = str(lot_id or '').strip()
+            if normalized_lot_id and normalized_lot_id not in seen_lot_ids:
+                seen_lot_ids.add(normalized_lot_id)
+                lot_ids.append(normalized_lot_id)
+        return lot_ids
 
     def _tray_id_in_payload(self, payload, variants):
         variant_set = {str(value or '').upper() for value in variants if value}
@@ -579,8 +694,9 @@ class GlobalTraySearchView(LoginRequiredMixin, View):
         3. Return first module where lot is active
 
         Workflow: Day Planning ? Input Screening ? Brass QC ? Brass Audit ? IQF
-                  ? Jig Loading ? Jig Unloading.  Nickel Wiping releases the
-                  physical tray, so Nickel and later modules are not F2 targets.
+                  ? Jig Loading ? Jig Unloading ? Nickel Wiping.  Normal tray
+                  assignment lookup stops before Nickel because the physical
+                  tray may be reused; Nickel has its own exact-ID resolver.
         """
         # Excess trays remain in Jig Loading after their parent jig moves on.
         # Resolve that physical tray ownership before historical lot candidates.
@@ -592,8 +708,110 @@ class GlobalTraySearchView(LoginRequiredMixin, View):
         # that separate from physical-tray lookup; this resolver itself filters
         # to active Jig Unloading records.
         if self._is_jig_id_format(tray_id):
-            return self._resolve_jig_unloading_by_jig_id(tray_id)
+            jig_result = self._resolve_jig_unloading_by_jig_id(tray_id)
+            if jig_result:
+                return jig_result
 
+            # A Jig Loading draft is the current owner before the jig reaches
+            # Inprocess Inspection/Jig Unloading.  Reuse the existing draft
+            # selector so F2 follows the same active-draft rules as JigView.
+            try:
+                from Jig_Loading.selectors import find_active_draft_by_jig_id
+                draft = find_active_draft_by_jig_id(tray_id, user=user)
+                if draft and draft.lot_id:
+                    result = self._check_lot_in_jig_loading(draft.lot_id)
+                    if result and self._is_main_or_pick_result(result):
+                        return result
+            except Exception as e:
+                logger.error('%s active Jig Loading jig lookup failed: %s', SCAN_TAG, e)
+            return None
+
+        # Nickel IDs are retained independently of reusable physical trays.
+        # Resolve them by exact ID and return only rows that are still visible
+        # in one of the existing Nickel Wiping pick tables.
+        nickel_lot_ids = self._resolve_active_nickel_wiping_lot_ids(tray_id)
+        requested_path = self._normalize_path(current_path) if current_path else ''
+        nickel_fallback = None
+        for label, check in (
+            ('Nickel Wiping', self._check_lot_in_nickel_wiping),
+            ('Nickel Wiping Z2', self._check_lot_in_nickel_wiping_z2),
+        ):
+            try:
+                for lid in nickel_lot_ids:
+                    result = check(lid)
+                    if not result or not self._is_main_or_pick_result(result):
+                        continue
+                    logger.info('%s nickel_module_match module=%s lot_id=%s', SCAN_TAG, label, lid)
+                    if nickel_fallback is None:
+                        nickel_fallback = result
+                    if self._path_matches(result.get('url'), requested_path):
+                        return result
+            except Exception as e:
+                logger.error('%s Unexpected error in %s: %s', SCAN_TAG, label, e)
+
+        nickel_audit_fallback = None
+        nickel_audit_lot_ids = []
+        try:
+            nickel_audit_lot_ids = self._resolve_nickel_audit_lot_ids(
+                tray_id, nickel_wiping_lot_ids=nickel_lot_ids,
+            )
+            for label, check in (
+                ('Nickel Audit', self._check_lot_in_nickel_audit_z1),
+                ('Nickel Audit Z2', self._check_lot_in_nickel_audit_z2),
+            ):
+                for lid in nickel_audit_lot_ids:
+                    result = check(lid)
+                    # F2 navigates only to active Pick Tables.  A tray may
+                    # have an older completed Nickel Audit record as well as
+                    # a newer current row; never select the completed row.
+                    if not result or not self._is_main_or_pick_result(result):
+                        continue
+                    logger.info('%s nickel_audit_module_match module=%s lot_id=%s', SCAN_TAG, label, lid)
+                    if nickel_audit_fallback is None:
+                        nickel_audit_fallback = result
+        except Exception as e:
+            logger.error('%s Unexpected error in Nickel Audit lookup: %s', SCAN_TAG, e)
+
+        # Spider Spindle uses the same Nickel Audit lot ID.  Resolve it here
+        # for JR/NR/ND identifiers, whose tray association is no longer in a
+        # normal physical-tray table by the time it reaches this stage.
+        spider_spindle_fallback = None
+        for label, check in (
+            ('Spider Spindle Z1', self._check_lot_in_ss_z1),
+            ('Spider Spindle Z2', self._check_lot_in_ss_z2),
+        ):
+            for lid in nickel_audit_lot_ids:
+                try:
+                    result = check(lid)
+                    if result and self._is_main_or_pick_result(result):
+                        logger.info('%s spider_spindle_module_match module=%s lot_id=%s', SCAN_TAG, label, lid)
+                        if spider_spindle_fallback is None:
+                            spider_spindle_fallback = result
+                except Exception as e:
+                    logger.error('%s Unexpected error in %s: %s', SCAN_TAG, label, e)
+
+        # JR/NR/ND remain Nickel-specific.  Prefer their current Nickel Audit
+        # successor Pick Table, then fall back through Nickel Audit and Wiping.
+        if self._is_nickel_specific_tray_id(tray_id):
+            return spider_spindle_fallback or nickel_audit_fallback or nickel_fallback
+
+        # Brass Audit may display a Brass QC acceptance snapshot after the
+        # physical tray has been delinked from the upstream tables.  Resolve
+        # only current Brass Audit rows using that page's existing tray source.
+        brass_audit_lot_ids = self._resolve_active_brass_audit_lot_ids(tray_id)
+        brass_audit_fallback = None
+        for lid in brass_audit_lot_ids:
+            try:
+                result = self._check_lot_in_brass_audit(lid)
+                if not result or not self._is_main_or_pick_result(result):
+                    continue
+                logger.info('%s brass_audit_snapshot_match lot_id=%s', SCAN_TAG, lid)
+                if brass_audit_fallback is None:
+                    brass_audit_fallback = result
+                if self._path_matches(result.get('url'), requested_path):
+                    return result
+            except Exception as e:
+                logger.error('%s Unexpected error in Brass Audit snapshot lookup: %s', SCAN_TAG, e)
         # Step 1: Resolve the current physical-tray assignment only. The legacy
         # resolver intentionally reads history, which is not valid for F2.
         lot_ids, batch_ids = self._resolve_active_tray_lot_ids(tray_id)
@@ -607,12 +825,14 @@ class GlobalTraySearchView(LoginRequiredMixin, View):
 
         if not lot_ids and not batch_ids:
             logger.info('%s no_candidates tray_id=%s', SCAN_TAG, tray_id)
-            return None
+            return brass_audit_fallback or nickel_audit_fallback or nickel_fallback
 
         # Step 2: Check each module's eligible Main/Pick table only.
         # Completed/Reject/history tables are deliberately not eligible for
         # global scan navigation/highlighting.
         checks = [
+            ('Spider Spindle Z1', self._check_lot_in_ss_z1),
+            ('Spider Spindle Z2', self._check_lot_in_ss_z2),
             ('Inprocess Inspection', self._check_lot_in_inprocess_inspection),
             ('Jig Unloading',   self._check_lot_in_jig_unloading),
             ('IQF',             self._check_lot_in_iqf),
@@ -623,12 +843,11 @@ class GlobalTraySearchView(LoginRequiredMixin, View):
             ('Jig Loading',     self._check_lot_in_jig_loading),
         ]
 
-        requested_path = self._normalize_path(current_path) if current_path else ''
         fallback_result = None
         for label, check in checks:
             try:
                 for lid in lot_ids:
-                    result = check(lid)
+                    result = check(lid, tray_id=tray_id) if label == 'IQF' else check(lid)
                     if result:
                         if not self._is_main_or_pick_result(result):
                             logger.info(
@@ -667,6 +886,18 @@ class GlobalTraySearchView(LoginRequiredMixin, View):
                     return result
             except Exception as e:
                 logger.error('%s DP batch fallback error: %s', SCAN_TAG, e)
+
+        # No new active lifecycle exists. A current Brass Audit snapshot is
+        # next, followed by the prior Nickel Wiping lifecycle. This ordering
+        # prevents an old Nickel lot from overriding a reused normal tray.
+        if brass_audit_fallback:
+            return brass_audit_fallback
+        if spider_spindle_fallback:
+            return spider_spindle_fallback
+        if nickel_audit_fallback:
+            return nickel_audit_fallback
+        if nickel_fallback:
+            return nickel_fallback
 
         return None
 
@@ -731,6 +962,11 @@ class GlobalTraySearchView(LoginRequiredMixin, View):
     def _is_jig_id_format(self, value):
         normalized = ''.join(str(value or '').split()).upper()
         return bool(re.match(r'^(JL-[A-Z]\d{5}|J\d{3}-\d{4})$', normalized))
+
+    @staticmethod
+    def _is_nickel_specific_tray_id(value):
+        normalized = ''.join(str(value or '').split()).upper()
+        return normalized.startswith(('JR-', 'NR-', 'ND-'))
 
     def _resolve_jig_unloading_by_jig_id(self, jig_id, candidate_lot_ids=None):
         try:
@@ -1061,7 +1297,17 @@ class GlobalTraySearchView(LoginRequiredMixin, View):
         active_filter = (
             (
                 (Q(na_qc_accptance__isnull=True) | Q(na_qc_accptance=False))
-                & (Q(na_qc_rejection__isnull=True) | Q(na_qc_rejection=False))
+                & (
+                    Q(na_qc_rejection__isnull=True)
+                    | Q(na_qc_rejection=False)
+                    # Match the Nickel Audit Pick Table: a rejection from a
+                    # previous cycle is stale after a newer Nickel Wiping
+                    # re-acceptance.
+                    | (
+                        Q(na_qc_rejection=True)
+                        & Q(nq_last_process_date_time__gt=F('na_last_process_date_time'))
+                    )
+                )
                 & ~Q(na_qc_few_cases_accptance=True, na_onhold_picking=False)
                 & (
                     Q(nq_qc_accptance=True)
@@ -1083,15 +1329,14 @@ class GlobalTraySearchView(LoginRequiredMixin, View):
         stock = self._stock_for(lot_id)
 
         if pick_row:
-            already_submitted = NickelAudit_Submission.objects.filter(lot_id=pick_row.lot_id).exists()
-            already_completed_source = False
+            # The Pick Table only treats a submission from the current Nickel
+            # Wiping cycle as completed.  Previous Audit-cycle submissions
+            # remain in history after rework under the same lot ID.
+            already_submitted = NickelAudit_Submission.objects.filter(
+                lot_id=pick_row.lot_id,
+                created_at__gt=pick_row.nq_last_process_date_time,
+            ).exists()
             if not already_submitted:
-                completed_sources = self._nickel_audit_completed_source_lot_ids(allowed_color_ids)
-                already_completed_source = any(
-                    source_lot in completed_sources
-                    for source_lot in self._nickel_audit_source_lot_ids(pick_row)
-                )
-            if not already_submitted and not already_completed_source:
                 return {
                     'module': module_name,
                     'url': reverse(url_name),
@@ -1224,8 +1469,11 @@ class GlobalTraySearchView(LoginRequiredMixin, View):
             logger.error('%s _check_lot_in_ss_z2: %s', SCAN_TAG, e)
             return None
 
-    def _check_lot_in_iqf(self, lot_id):
+    def _check_lot_in_iqf(self, lot_id, tray_id):
         try:
+            from IQF.services.selectors import is_current_iqf_scan_tray
+            if not is_current_iqf_scan_tray(tray_id, lot_id):
+                return None
             from IQF.services.selectors import get_iqf_picktable_base_queryset
             stock = self._stock_for(lot_id)
 
