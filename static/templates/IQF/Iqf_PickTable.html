@@ -2936,7 +2936,7 @@
               var trayId = (inp.value || '').trim();
               var qty = parseInt(inp.getAttribute('data-expected-qty') || '0', 10);
               var isTop = inp.getAttribute('data-is-top-tray') === 'true';
-              if(trayId && qty > 0){
+              if(qty > 0){
                 acceptedTraysForDraft.push({ tray_id: trayId, qty: qty, is_top_tray: isTop });
               }
             });
@@ -2945,7 +2945,7 @@
               var trayId = (inp.value || '').trim();
               var qty = parseInt(inp.getAttribute('data-rej-qty') || '0', 10);
               var isTop = inp.getAttribute('data-is-top') === 'true';
-              if(trayId && qty > 0){
+              if(qty > 0){
                 rejectedTraysForDraft.push({ tray_id: trayId, qty: qty, is_top_tray: isTop });
               }
             });
@@ -3181,7 +3181,7 @@
       var trayId = (inp.value || '').trim();
       var qty = parseInt(inp.getAttribute('data-expected-qty') || '0', 10);
       var isTop = inp.getAttribute('data-is-top-tray') === 'true';
-      if(trayId && qty > 0){
+      if(qty > 0){
         acceptedTrays.push({ tray_id: trayId, qty: qty, is_top_tray: isTop });
       }
     });
@@ -3191,7 +3191,7 @@
       var trayId = (inp.value || '').trim();
       var qty = parseInt(inp.getAttribute('data-rej-qty') || '0', 10);
       var isTop = inp.getAttribute('data-is-top') === 'true';
-      if(trayId && qty > 0){
+      if(qty > 0){
         rejectedTrays.push({ tray_id: trayId, qty: qty, is_top_tray: isTop });
       }
     });
@@ -4012,6 +4012,22 @@ document.addEventListener('click', function(evt){
         }
         var slots = data.slots || [];
         var acceptedQty = data.accepted_qty || 0;
+        // Preserve the exact accepted allocation saved with a draft.  The
+        // server-generated slots remain the source for a new audit and for
+        // legacy drafts that do not contain a tray-level snapshot.
+        var _draftAcceptedSlots = window._iqfDraftAcceptedTrays || [];
+        if(_draftAcceptedSlots.length > 0){
+          slots = _draftAcceptedSlots
+            .filter(function(tray){ return parseInt(tray.qty || 0, 10) > 0; })
+            .map(function(tray, index){
+              return {
+                slot_no: index + 1,
+                qty: parseInt(tray.qty || 0, 10),
+                is_top_tray: tray.is_top_tray === true || tray.is_top === true
+              };
+            });
+          acceptedQty = slots.reduce(function(total, slot){ return total + slot.qty; }, 0);
+        }
         var maxReuse = data.max_reuse_limit || 0;
         window._iqfTrayCapacity = data.tray_capacity || 16;
 
@@ -4546,52 +4562,58 @@ document.addEventListener('click', function(evt){
     window._iqfRejectSlotsRendered = true;
     window._iqfLastRenderedRejTotal = totalIqfQty;
 
-    // ERR3 FIX: Correct qty distribution
-    //   top tray = totalIqfQty % capacity  (the partial / remainder tray)
-    //   all others = capacity              (strictly fully filled)
-    // Resolve capacity from the CURRENT model/lot first.
-    // This prevents a previous model's capacity (for example 16)
-    // from carrying over when another 1805 model is opened.
-    var _cap = 0;
-    var _currentModelNo = '';
-    var _modelEl = document.getElementById('modalModelNo');
-    if(_modelEl){
-      _currentModelNo = String(_modelEl.textContent || '').trim().toUpperCase();
-    }
+    // A saved draft owns its tray-wise allocation.  Do not recalculate a saved
+    // distribution from the current capacity: the capacity may have changed
+    // since the draft was created, while the slot quantities must remain exact.
+    var _draftRejectedTrays = window._iqfDraftRejectedTrays || [];
+    var _rejSlots = _draftRejectedTrays
+      .filter(function(tray){ return parseInt(tray.qty || 0, 10) > 0; })
+      .map(function(tray, index){
+        return {
+          slot_no: index + 1,
+          qty: parseInt(tray.qty || 0, 10),
+          is_top: tray.is_top_tray === true || tray.is_top === true
+        };
+      });
 
-    // Series-specific IQF capacity.
-    if(_currentModelNo.indexOf('1805') === 0){
-      _cap = 12;
-    }else if(_currentModelNo.indexOf('2649') === 0 || _currentModelNo.indexOf('2617') === 0){
-      _cap = 16;
-    }
+    if(_rejSlots.length === 0){
+      // New audit (or a legacy draft without tray slots): calculate the normal
+      // capacity-based allocation.
+      var _cap = 0;
+      var _currentModelNo = '';
+      var _modelEl = document.getElementById('modalModelNo');
+      if(_modelEl){
+        _currentModelNo = String(_modelEl.textContent || '').trim().toUpperCase();
+      }
 
-    // For other series, use the current lot tray capacity.
-    if(_cap <= 0){
-      var _currentLotTraysForCap = window._iqfCurrentLotTrays || [];
-      for(var _ctc = 0; _ctc < _currentLotTraysForCap.length; _ctc++){
-        var _lotCap = parseInt(_currentLotTraysForCap[_ctc].tray_capacity || 0, 10);
-        if(_lotCap > 0){
-          _cap = _lotCap;
-          break;
+      if(_currentModelNo.indexOf('1805') === 0){
+        _cap = 12;
+      }else if(_currentModelNo.indexOf('2649') === 0 || _currentModelNo.indexOf('2617') === 0){
+        _cap = 16;
+      }
+
+      if(_cap <= 0){
+        var _currentLotTraysForCap = window._iqfCurrentLotTrays || [];
+        for(var _ctc = 0; _ctc < _currentLotTraysForCap.length; _ctc++){
+          var _lotCap = parseInt(_currentLotTraysForCap[_ctc].tray_capacity || 0, 10);
+          if(_lotCap > 0){
+            _cap = _lotCap;
+            break;
+          }
         }
       }
-    }
 
-    // Final fallback to the backend value.
-    if(_cap <= 0){
-      _cap = parseInt(window._iqfTrayCapacity || 16, 10);
-    }
+      if(_cap <= 0){
+        _cap = parseInt(window._iqfTrayCapacity || 16, 10);
+      }
 
-    console.log('[IQF REJECT CAPACITY] model=', _currentModelNo, 'capacity=', _cap);
-
-    var _rem = totalIqfQty % _cap;
-    var _fullCount = Math.floor(totalIqfQty / _cap);
-
-    var _rejSlots = [];
-    if(_rem > 0){ _rejSlots.push({ slot_no: 1, qty: _rem, is_top: true }); }
-    for(var _rs = 0; _rs < _fullCount; _rs++){
-      _rejSlots.push({ slot_no: _rejSlots.length + 1, qty: _cap, is_top: false });
+      console.log('[IQF REJECT CAPACITY] model=', _currentModelNo, 'capacity=', _cap);
+      var _rem = totalIqfQty % _cap;
+      var _fullCount = Math.floor(totalIqfQty / _cap);
+      if(_rem > 0){ _rejSlots.push({ slot_no: 1, qty: _rem, is_top: true }); }
+      for(var _rs = 0; _rs < _fullCount; _rs++){
+        _rejSlots.push({ slot_no: _rejSlots.length + 1, qty: _cap, is_top: false });
+      }
     }
 
     // Render scan input rows (ERR1 FIX: empty inputs, user scans reject tray IDs)
@@ -4628,7 +4650,6 @@ document.addEventListener('click', function(evt){
       }
     });
 
-    var _draftRejectedTrays = window._iqfDraftRejectedTrays || [];
     if(_draftRejectedTrays.length > 0){
       var _allRejectInputs = document.querySelectorAll('#iqf-reject-tbody .rej-scan-input');
       _draftRejectedTrays.forEach(function(dt, di){

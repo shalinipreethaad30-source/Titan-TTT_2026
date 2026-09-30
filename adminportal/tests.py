@@ -134,6 +134,16 @@ class GlobalTraySearchAccessTests(SimpleTestCase):
         )
         self.nickel_audit_resolver.start()
         self.addCleanup(self.nickel_audit_resolver.stop)
+        self.nickel_wiping_resolver = patch.object(
+            GlobalTraySearchView, '_resolve_active_nickel_wiping_lot_ids', return_value=[]
+        )
+        self.nickel_wiping_resolver.start()
+        self.addCleanup(self.nickel_wiping_resolver.stop)
+        self.inprocess_jig_resolver = patch.object(
+            GlobalTraySearchView, '_resolve_inprocess_by_jig_id', return_value=None
+        )
+        self.inprocess_jig_resolver.start()
+        self.addCleanup(self.inprocess_jig_resolver.stop)
         self.spider_spindle_z1 = patch.object(GlobalTraySearchView, '_check_lot_in_ss_z1', return_value=None)
         self.spider_spindle_z2 = patch.object(GlobalTraySearchView, '_check_lot_in_ss_z2', return_value=None)
         self.spider_spindle_z1.start()
@@ -351,6 +361,26 @@ class GlobalTraySearchAccessTests(SimpleTestCase):
         self.assertEqual(result, nickel_result)
         normal_tray_resolver.assert_not_called()
 
+    def test_jl_tray_in_nickel_wiping_uses_nickel_pick_table_not_jig_lookup(self):
+        view = GlobalTraySearchView()
+        nickel_result = {
+            'module': 'Nickel Wiping Z2',
+            'url': '/nickle_inspection_zone_two/NQ_Zone_PickTable/',
+            'lot_id': 'NW-CURRENT',
+        }
+
+        with patch('adminportal.global_scan.find_active_excess_lot_by_tray', return_value=None), \
+             patch.object(view, '_resolve_active_nickel_wiping_lot_ids', return_value=['NW-CURRENT']), \
+             patch.object(view, '_check_lot_in_nickel_wiping', return_value=None), \
+             patch.object(view, '_check_lot_in_nickel_wiping_z2', return_value=nickel_result), \
+             patch.object(view, '_resolve_active_brass_audit_lot_ids', return_value=[]), \
+             patch.object(view, '_resolve_active_tray_lot_ids', return_value=(set(), set())), \
+             patch.object(view, '_resolve_jig_unloading_by_jig_id') as jig_lookup:
+            result = view._search_all_modules('JL-A00121')
+
+        self.assertEqual(result, nickel_result)
+        jig_lookup.assert_not_called()
+
     def test_inactive_nickel_history_does_not_block_current_reused_tray(self):
         view = GlobalTraySearchView()
         current_result = {
@@ -490,6 +520,31 @@ class GlobalTraySearchAccessTests(SimpleTestCase):
 
         self.assertEqual(result, spider_result)
 
+    def test_jl_tray_in_spider_spindle_uses_spider_pick_table_not_jig_lookup(self):
+        view = GlobalTraySearchView()
+        spider_result = {
+            'module': 'Spider Spindle Z1',
+            'url': '/spider_spindle/ss_z1_pick_table/',
+            'lot_id': 'SS-CURRENT',
+        }
+
+        with patch('adminportal.global_scan.find_active_excess_lot_by_tray', return_value=None), \
+             patch.object(view, '_resolve_active_nickel_wiping_lot_ids', return_value=['SS-CURRENT']), \
+             patch.object(view, '_check_lot_in_nickel_wiping', return_value=None), \
+             patch.object(view, '_check_lot_in_nickel_wiping_z2', return_value=None), \
+             patch.object(view, '_resolve_nickel_audit_lot_ids', return_value=['SS-CURRENT']), \
+             patch.object(view, '_check_lot_in_nickel_audit_z1', return_value=None), \
+             patch.object(view, '_check_lot_in_nickel_audit_z2', return_value=None), \
+             patch.object(view, '_check_lot_in_ss_z1', return_value=spider_result), \
+             patch.object(view, '_check_lot_in_ss_z2', return_value=None), \
+             patch.object(view, '_resolve_active_brass_audit_lot_ids', return_value=[]), \
+             patch.object(view, '_resolve_active_tray_lot_ids', return_value=(set(), set())), \
+             patch.object(view, '_resolve_jig_unloading_by_jig_id') as jig_lookup:
+            result = view._search_all_modules('JL-A00121')
+
+        self.assertEqual(result, spider_result)
+        jig_lookup.assert_not_called()
+
     def test_jig_loading_draft_is_used_when_jig_is_not_yet_in_unloading(self):
         view = GlobalTraySearchView()
         draft = type('JigDraft', (), {'lot_id': 'JIG-DRAFT-LOT'})()
@@ -507,6 +562,24 @@ class GlobalTraySearchAccessTests(SimpleTestCase):
 
         self.assertEqual(result, jig_loading_result)
         draft_resolver.assert_called_once_with('J144-0001', user=self.user)
+
+    def test_jig_id_in_inprocess_uses_inprocess_pick_table_before_jig_unloading(self):
+        view = GlobalTraySearchView()
+        inprocess_result = {
+            'module': 'Inprocess Inspection',
+            'url': '/inprocess_inspection/inprocess_inspection_main/',
+            'lot_id': 'IP-CURRENT',
+            'jig_id': 'J144-0001',
+        }
+
+        with patch('adminportal.global_scan.find_active_excess_lot_by_tray', return_value=None), \
+             patch.object(view, '_resolve_active_nickel_wiping_lot_ids', return_value=[]), \
+             patch.object(view, '_resolve_inprocess_by_jig_id', return_value=inprocess_result), \
+             patch.object(view, '_resolve_jig_unloading_by_jig_id') as jig_unloading_lookup:
+            result = view._search_all_modules('J144-0001')
+
+        self.assertEqual(result, inprocess_result)
+        jig_unloading_lookup.assert_not_called()
 
     def test_jig_scan_keeps_its_active_jig_unloading_lookup(self):
         view = GlobalTraySearchView()

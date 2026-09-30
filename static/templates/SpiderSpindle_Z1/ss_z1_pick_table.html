@@ -1029,7 +1029,9 @@ document.addEventListener('DOMContentLoaded', function() {
     const actionable = event.target.closest(
       'button, a, input, select, textarea, [role="button"]'
     );
-    if (!actionable || actionable.closest('.model-hover-trigger')) return;
+    // Moving Add Spider on focus interrupts the pointer click before mouse-up.
+    // Its click handler highlights the row after the click has completed.
+    if (!actionable || actionable.closest('.model-hover-trigger, .btn-add-spider')) return;
     highlightRow(actionable.closest('tr'));
   });
 
@@ -1052,6 +1054,8 @@ document.addEventListener('DOMContentLoaded', function() {
       fetch(`{% url 'ss_z1_get_all_trays' %}?lot_id=${encodeURIComponent(lotId)}`)
         .then(r => r.json())
         .then(data => {
+          if (document.getElementById('modalLotId').value !== lotId ||
+              !document.getElementById('addSpiderModal').classList.contains('open')) return;
           document.getElementById('modalPlatingStkNoText').textContent = data.plating_stk_no || '-';
           document.getElementById('modalTotalQtyText').textContent = data.total_case_qty || '-';
           const trayList = document.getElementById('modalTrayList');
@@ -1084,6 +1088,8 @@ document.addEventListener('DOMContentLoaded', function() {
           }
         })
         .catch(() => {
+          if (document.getElementById('modalLotId').value !== lotId ||
+              !document.getElementById('addSpiderModal').classList.contains('open')) return;
           document.getElementById('modalTrayList').innerHTML = '<div class="ss-tray-empty text-danger">Error loading trays.</div>';
           document.getElementById('modalTrayCount').textContent = '0 trays';
         });

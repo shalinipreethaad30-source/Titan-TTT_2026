@@ -5331,6 +5331,10 @@ document.addEventListener("click", async function(event) {
         if (!isReleased) {
             const trayIdInputs = detailsDiv.querySelectorAll('input[type="text"]:not([readonly])');
             trayIdInputs.forEach((input, idx, allInputs) => {
+                // This row owns validation.  The legacy delegated input
+                // listener below must not send a second request for the same
+                // barcode scan.
+                input.dataset.dpRowValidationBound = 'true';
                 input.addEventListener('input', function () {
                   hideTraySlotExceededInfo();
                     let prevError = input.parentNode.querySelector('.tray-id-error');
@@ -7311,7 +7315,7 @@ All other actions (edit, delete, filter, etc.) are blocked visually and function
  <!-- Tray ID - Instant Validation -->
 <script nonce="{{ csp_nonce }}">
   document.body.addEventListener('input', function (e) {
-    if (e.target.classList.contains('tray-id-input')) {
+    if (e.target.classList.contains('tray-id-input') && e.target.dataset.dpRowValidationBound !== 'true') {
       // Remove previous error
       let prevError = e.target.parentNode.querySelector('.tray-id-error');
       if (prevError) prevError.remove();

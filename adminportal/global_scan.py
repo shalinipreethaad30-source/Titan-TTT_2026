@@ -704,10 +704,18 @@ class GlobalTraySearchView(LoginRequiredMixin, View):
         if excess:
             return {'module': 'Jig Loading', 'url': reverse('JigView'), **excess}
 
-        # F2 also supports scanning a jig label on Jig Unloading screens. Keep
-        # that separate from physical-tray lookup; this resolver itself filters
-        # to active Jig Unloading records.
-        if self._is_jig_id_format(tray_id):
+        # A JL-* value can be a Jig Loading label or a physical tray ID that
+        # has progressed into the Nickel workflow.  Resolve an exact Nickel
+        # association first so the jig shortcut cannot hide that active tray.
+        nickel_lot_ids = self._resolve_active_nickel_wiping_lot_ids(tray_id)
+
+        # F2 also supports scanning a jig label on Jig Unloading screens when
+        # the value is not retained as a Nickel workflow tray.
+        if self._is_jig_id_format(tray_id) and not nickel_lot_ids:
+            inprocess_result = self._resolve_inprocess_by_jig_id(tray_id)
+            if inprocess_result:
+                return inprocess_result
+
             jig_result = self._resolve_jig_unloading_by_jig_id(tray_id)
             if jig_result:
                 return jig_result
@@ -729,7 +737,6 @@ class GlobalTraySearchView(LoginRequiredMixin, View):
         # Nickel IDs are retained independently of reusable physical trays.
         # Resolve them by exact ID and return only rows that are still visible
         # in one of the existing Nickel Wiping pick tables.
-        nickel_lot_ids = self._resolve_active_nickel_wiping_lot_ids(tray_id)
         requested_path = self._normalize_path(current_path) if current_path else ''
         nickel_fallback = None
         for label, check in (
@@ -825,7 +832,12 @@ class GlobalTraySearchView(LoginRequiredMixin, View):
 
         if not lot_ids and not batch_ids:
             logger.info('%s no_candidates tray_id=%s', SCAN_TAG, tray_id)
-            return brass_audit_fallback or nickel_audit_fallback or nickel_fallback
+            return (
+                brass_audit_fallback
+                or spider_spindle_fallback
+                or nickel_audit_fallback
+                or nickel_fallback
+            )
 
         # Step 2: Check each module's eligible Main/Pick table only.
         # Completed/Reject/history tables are deliberately not eligible for
@@ -962,6 +974,26 @@ class GlobalTraySearchView(LoginRequiredMixin, View):
     def _is_jig_id_format(self, value):
         normalized = ''.join(str(value or '').split()).upper()
         return bool(re.match(r'^(JL-[A-Z]\d{5}|J\d{3}-\d{4})$', normalized))
+
+    def _resolve_inprocess_by_jig_id(self, jig_id):
+        """Return the current Inprocess Inspection Pick Table row for a jig."""
+        try:
+            from Jig_Loading.models import JigCompleted
+
+            normalized_jig_id = ''.join(str(jig_id or '').split()).upper()
+            active_jigs = JigCompleted.objects.filter(
+                jig_id__iexact=normalized_jig_id,
+                draft_status='submitted',
+                jig_position__isnull=True,
+            ).order_by('-updated_at')
+            for jig in active_jigs:
+                result = self._check_lot_in_inprocess_inspection(jig.lot_id)
+                if result and self._is_main_or_pick_result(result):
+                    result['jig_id'] = jig.jig_id or normalized_jig_id
+                    return result
+        except Exception as e:
+            logger.error('%s _resolve_inprocess_by_jig_id: %s', SCAN_TAG, e)
+        return None
 
     @staticmethod
     def _is_nickel_specific_tray_id(value):
